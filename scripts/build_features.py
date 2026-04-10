@@ -66,15 +66,27 @@ def load_historical_matches(sb: Client, seasons: list[int]) -> pd.DataFrame:
 
 
 def load_matches(sb: Client, seasons: list[int]) -> pd.DataFrame:
-    resp = (
-        sb.table("matches")
-        .select("*")
-        .in_("season", seasons)
-        .eq("status", "FINISHED")
-        .order("match_date")
-        .execute()
-    )
-    df = pd.DataFrame(resp.data)
+    all_data = []
+    page_size = 1000
+    offset = 0
+    while True:
+        resp = (
+            sb.table("matches")
+            .select("*")
+            .in_("season", seasons)
+            .eq("status", "FINISHED")
+            .order("match_date")
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+        if not resp.data:
+            break
+        all_data.extend(resp.data)
+        if len(resp.data) < page_size:
+            break
+        offset += page_size
+    log.info(f"  {len(all_data)} partidas (football-data) carregadas")
+    df = pd.DataFrame(all_data)
     df["match_date"] = pd.to_datetime(df["match_date"], utc=True)
     return df
 
