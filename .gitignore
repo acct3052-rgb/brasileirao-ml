@@ -1,0 +1,23 @@
+# Ignore vscode AI rules
+.github/instructions/codacy.instructions.md
+
+# Ambiente e segredos
+.env
+credenciais.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pkl
+*.egg-info/
+.venv/
+venv/
+
+# Modelos treinados
+models/
+
+# Dados locais
+data/
+
+# Logs do cron
+logs/

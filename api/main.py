@@ -1,0 +1,1218 @@
+"""
+API FastAPI — Brasileirão ML
+Serve predições, fixtures e métricas do modelo.
+
+Endpoints:
+    GET  /health                    → status da API
+    GET  /api/fixtures              → próximos jogos com predições
+    POST /api/predict               → prediz um jogo específico
+    GET  /api/accuracy              → acurácia histórica do modelo
+    POST /api/retrain               → retreina modelo (protegido) com status
+    GET  /api/retrain/status        → status do retreinamento
+    GET  /api/bets                  → lista apostas do usuário
+    POST /api/bets                  → registra nova aposta
+    DELETE /api/bets/{id}           → remove aposta
+    GET  /api/bets/metrics          → métricas de bankroll
+    POST /api/run-etl               → dispara coleta + features (protegido)
+"""
+
+import os
+import pickle
+import logging
+import subprocess
+import threading
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Literal
+
+import httpx
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
+from scipy.stats import poisson
+from supabase import create_client, Client
+from dotenv import load_dotenv
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+MODELS_DIR = "models"
+FEATURE_COLS = [
+    "home_form_pts", "away_form_pts",
+    "home_form_gf",  "away_form_gf",
+    "home_form_ga",  "away_form_ga",
+    "home_home_pts", "away_away_pts",
+    "home_home_gf",  "away_away_gf",
+    "home_home_ga",  "away_away_ga",
+    "h2h_home_wins", "h2h_draws", "h2h_away_wins",
+    "h2h_home_gf_avg", "h2h_away_gf_avg",
+    "home_table_pos", "away_table_pos",
+    "home_table_pts", "away_table_pts",
+    "pos_diff", "pts_diff",
+    "home_avg_xg", "away_avg_xg",
+    "home_avg_xga", "away_avg_xga",
+    "home_xg_net", "away_xg_net",
+    "home_avg_poss",
+    "squad_value_ratio",
+    "home_attendance_pct",
+    "matchday",
+]
+
+HOME_SPLIT_COLS = [
+    "home_form_pts", "home_form_gf", "home_form_ga",
+    "home_home_pts", "home_home_gf", "home_home_ga",
+    "h2h_home_wins", "h2h_draws", "h2h_home_gf_avg",
+    "home_table_pos", "home_table_pts",
+    "pos_diff", "pts_diff",
+    "home_avg_xg", "home_avg_xga", "home_xg_net",
+    "home_avg_poss",
+    "squad_value_ratio",
+    "home_attendance_pct",
+    "matchday",
+]
+
+AWAY_SPLIT_COLS = [
+    "away_form_pts", "away_form_gf", "away_form_ga",
+    "away_away_pts", "away_away_gf", "away_away_ga",
+    "h2h_away_wins", "h2h_draws", "h2h_away_gf_avg",
+    "away_table_pos", "away_table_pts",
+    "pos_diff", "pts_diff",
+    "away_avg_xg", "away_avg_xga",
+    "squad_value_ratio",
+    "home_attendance_pct",
+    "matchday",
+]
+
+# Pesos do blend: [resultado_geral, home_split, away_split]
+_BLEND_WEIGHTS = [0.5, 0.25, 0.25]
+
+# ── Estado global dos modelos ─────────────────────────────────────────────────
+
+models = {}
+
+# ── Estado do retreinamento ───────────────────────────────────────────────────
+
+_retrain_lock = threading.Lock()
+_retrain_state: dict = {
+    "status": "idle",   # idle | running | done | error
+    "started_at": None,
+    "finished_at": None,
+    "error": None,
+}
+
+
+def load_models():
+    for name in ["result_model", "label_encoder", "home_goals_model", "away_goals_model",
+                 "home_split_model", "away_split_model"]:
+        path = f"{MODELS_DIR}/{name}_latest.pkl"
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                models[name] = pickle.load(f)
+            log.info(f"Modelo carregado: {name}")
+        else:
+            models[name] = None
+            if name not in ("home_split_model", "away_split_model"):
+                log.warning(f"Modelo não encontrado: {path}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    load_models()
+    yield
+
+
+# ── App ────────────────────────────────────────────────────────────────────────
+
+app = FastAPI(
+    title="Brasileirão ML API",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+security = HTTPBearer(auto_error=False)
+
+
+def get_supabase() -> Client:
+    return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+
+
+def verify_admin(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    admin_token = os.environ.get("ADMIN_TOKEN", "")
+    if not credentials or credentials.credentials != admin_token:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    return True
+
+
+# ── Helpers de predição ────────────────────────────────────────────────────────
+
+# Parâmetro rho da correção Dixon-Coles (estimado empiricamente para o Brasileirão).
+# Valores típicos: -0.10 a -0.20. Corrige sub-contagem de 0-0 e super-contagem de 1-1.
+_DIXON_COLES_RHO = -0.13
+
+
+def _dc_tau(home_goals: int, away_goals: int, lh: float, la: float, rho: float) -> float:
+    """
+    Fator de correção Dixon-Coles para placares baixos.
+    Só afeta os 4 placares: (0,0), (0,1), (1,0), (1,1).
+    """
+    if home_goals == 0 and away_goals == 0:
+        return 1 - lh * la * rho
+    elif home_goals == 0 and away_goals == 1:
+        return 1 + lh * rho
+    elif home_goals == 1 and away_goals == 0:
+        return 1 + la * rho
+    elif home_goals == 1 and away_goals == 1:
+        return 1 - rho
+    return 1.0
+
+
+def _score_matrix_dc(lh: float, la: float, max_goals: int = 10) -> list[list[float]]:
+    """
+    Retorna matriz de probabilidade P(h, a) com correção Dixon-Coles.
+    matrix[h][a] = probabilidade do placar h–a.
+    """
+    matrix = []
+    for h in range(max_goals + 1):
+        row = []
+        for a in range(max_goals + 1):
+            p = poisson.pmf(h, lh) * poisson.pmf(a, la)
+            p *= _dc_tau(h, a, lh, la, _DIXON_COLES_RHO)
+            row.append(float(p))
+        matrix.append(row)
+    return matrix
+
+
+def over_n_prob(lambda_home: float, lambda_away: float, n: float) -> float:
+    """P(total de gols > n) com correção Dixon-Coles para placares baixos."""
+    matrix = _score_matrix_dc(lambda_home, lambda_away)
+    prob_over = 0.0
+    for h, row in enumerate(matrix):
+        for a, p in enumerate(row):
+            if h + a > n:
+                prob_over += p
+    return float(prob_over)
+
+
+def btts_prob(lambda_home: float, lambda_away: float) -> float:
+    """P(ambos marcam) com correção Dixon-Coles."""
+    matrix = _score_matrix_dc(lambda_home, lambda_away)
+    # P(h>=1 e a>=1) = 1 - P(h=0) - P(a=0) + P(h=0,a=0)
+    prob_h0 = sum(matrix[0])           # home marca 0
+    prob_a0 = sum(row[0] for row in matrix)  # away marca 0
+    prob_00 = matrix[0][0]
+    return float(1 - prob_h0 - prob_a0 + prob_00)
+
+
+def over25_prob(lambda_home: float, lambda_away: float) -> float:
+    return over_n_prob(lambda_home, lambda_away, 2.5)
+
+
+def result_probs_dc(lambda_home: float, lambda_away: float) -> tuple[float, float, float]:
+    """
+    Probabilidades H/D/A calculadas via Dixon-Coles.
+    Útil para validar / complementar o XGBoost.
+    """
+    matrix = _score_matrix_dc(lambda_home, lambda_away)
+    p_home = p_draw = p_away = 0.0
+    for h, row in enumerate(matrix):
+        for a, p in enumerate(row):
+            if h > a:
+                p_home += p
+            elif h == a:
+                p_draw += p
+            else:
+                p_away += p
+    total = p_home + p_draw + p_away
+    if total > 0:
+        p_home, p_draw, p_away = p_home / total, p_draw / total, p_away / total
+    return p_home, p_draw, p_away
+
+
+def predict_from_features(features: dict) -> dict:
+    if not models.get("result_model"):
+        raise HTTPException(status_code=503, detail="Modelo não carregado")
+
+    X_full = pd.DataFrame([features])[FEATURE_COLS].fillna(0)
+    classes = models["label_encoder"].classes_  # ['A', 'D', 'H']
+
+    # Resultado — blend entre modelo geral + splits home/away (se disponíveis)
+    proba_general = models["result_model"].predict_proba(X_full)[0]
+
+    home_split = models.get("home_split_model")
+    away_split = models.get("away_split_model")
+
+    if home_split is not None and away_split is not None:
+        X_home = pd.DataFrame([features])[HOME_SPLIT_COLS].fillna(0)
+        X_away = pd.DataFrame([features])[AWAY_SPLIT_COLS].fillna(0)
+        proba_home_split = home_split.predict_proba(X_home)[0]
+        proba_away_split = away_split.predict_proba(X_away)[0]
+        w = _BLEND_WEIGHTS
+        proba = (w[0] * proba_general + w[1] * proba_home_split + w[2] * proba_away_split)
+    else:
+        proba = proba_general
+
+    # Gols esperados (necessário antes do blend DC)
+    lambda_home = float(models["home_goals_model"].predict(X_full)[0])
+    lambda_away = float(models["away_goals_model"].predict(X_full)[0])
+    lambda_home = max(0.1, lambda_home)
+    lambda_away = max(0.1, lambda_away)
+
+    # Dixon-Coles: blend 70% XGBoost + 30% DC para suavizar placares baixos
+    dc_h, dc_d, dc_a = result_probs_dc(lambda_home, lambda_away)
+    # classes = ['A', 'D', 'H'] → índices: A=0, D=1, H=2
+    xgb_h = float(proba[np.where(classes == 'H')[0][0]])
+    xgb_d = float(proba[np.where(classes == 'D')[0][0]])
+    xgb_a = float(proba[np.where(classes == 'A')[0][0]])
+
+    DC_WEIGHT = 0.20  # 20% Dixon-Coles, 80% XGBoost blend
+    final_h = (1 - DC_WEIGHT) * xgb_h + DC_WEIGHT * dc_h
+    final_d = (1 - DC_WEIGHT) * xgb_d + DC_WEIGHT * dc_d
+    final_a = (1 - DC_WEIGHT) * xgb_a + DC_WEIGHT * dc_a
+
+    prob_map = {"H": final_h, "D": final_d, "A": final_a}
+    proba_final = np.array([final_a, final_d, final_h])  # ['A','D','H']
+
+    predicted_result = classes[np.argmax(proba_final)]
+    confidence = float(np.max(proba_final))
+
+    return {
+        "prob_home":              prob_map.get("H", 0.0),
+        "prob_draw":              prob_map.get("D", 0.0),
+        "prob_away":              prob_map.get("A", 0.0),
+        "predicted_result":       predicted_result,
+        "confidence":             confidence,
+        "expected_goals_home":    round(lambda_home, 2),
+        "expected_goals_away":    round(lambda_away, 2),
+        "expected_total_goals":   round(lambda_home + lambda_away, 2),
+        "over_25_prob":           round(over25_prob(lambda_home, lambda_away), 3),
+    }
+
+
+# ── Endpoints ──────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    loaded = [k for k, v in models.items() if v is not None]
+    blend_active = models.get("home_split_model") is not None and models.get("away_split_model") is not None
+    return {
+        "status": "ok",
+        "models_loaded": loaded,
+        "blend_active": blend_active,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/api/fixtures")
+def get_fixtures(limit: int = 50, sb: Client = Depends(get_supabase)):
+    """Próximos jogos do Brasileirão com predições."""
+    resp = sb.table("upcoming_predictions").select("*").limit(limit).execute()
+    return {"fixtures": resp.data, "count": len(resp.data)}
+
+
+@app.get("/api/accuracy")
+def get_accuracy(sb: Client = Depends(get_supabase)):
+    """Acurácia histórica do modelo."""
+    resp = sb.table("model_accuracy").select("*").execute()
+    return resp.data[0] if resp.data else {"total_predictions": 0, "accuracy_pct": None}
+
+
+@app.get("/api/predictions/recent")
+def get_recent_predictions(limit: int = 20, sb: Client = Depends(get_supabase)):
+    """Últimas predições com resultado real (para validação)."""
+    resp = (
+        sb.table("predictions")
+        .select("*, matches!inner(match_date, home_team:home_team_id(name), away_team:away_team_id(name), home_goals, away_goals)")
+        .not_.is_("actual_result", "null")
+        .order("predicted_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return {"predictions": resp.data}
+
+
+class PredictRequest(BaseModel):
+    match_id: int | None = None
+    features: dict | None = None
+
+
+@app.post("/api/predict")
+def predict_match(req: PredictRequest, sb: Client = Depends(get_supabase)):
+    if req.match_id:
+        resp = sb.table("match_features").select("*").eq("match_id", req.match_id).execute()
+        if not resp.data:
+            raise HTTPException(404, f"Features não encontradas para match_id={req.match_id}")
+        features = resp.data[0]
+    elif req.features:
+        features = req.features
+    else:
+        raise HTTPException(400, "Forneça match_id ou features")
+
+    result = predict_from_features(features)
+
+    if req.match_id:
+        sb.table("predictions").upsert(
+            {**result, "match_id": req.match_id, "model_version": "1.0"},
+            on_conflict="match_id"
+        ).execute()
+
+    return result
+
+
+@app.post("/api/predict/batch")
+def predict_batch(sb: Client = Depends(get_supabase)):
+    if not models.get("result_model"):
+        raise HTTPException(503, "Modelo não carregado")
+
+    resp = (
+        sb.table("match_features")
+        .select("*, matches!inner(status)")
+        .execute()
+    )
+
+    predicted_ids = {
+        r["match_id"] for r in sb.table("predictions").select("match_id").execute().data
+    }
+
+    to_predict = [
+        r for r in resp.data
+        if r["match_id"] not in predicted_ids
+        and r.get("matches", {}).get("status") in ("SCHEDULED", "TIMED")
+    ]
+
+    results = []
+    for features in to_predict:
+        try:
+            pred = predict_from_features(features)
+            sb.table("predictions").upsert(
+                {**pred, "match_id": features["match_id"], "model_version": "1.0"},
+                on_conflict="match_id"
+            ).execute()
+            results.append({"match_id": features["match_id"], "status": "ok"})
+        except Exception as e:
+            results.append({"match_id": features["match_id"], "status": f"erro: {e}"})
+
+    return {"predicted": len(results), "details": results}
+
+
+@app.post("/api/update-results")
+def update_results(sb: Client = Depends(get_supabase)):
+    """Atualiza actual_result nas predições e status nas apostas do usuário."""
+    resp = (
+        sb.table("predictions")
+        .select("match_id, predicted_result, matches!inner(result, status)")
+        .is_("actual_result", "null")
+        .execute()
+    )
+
+    updated = 0
+    finished_match_ids = []
+    for row in resp.data:
+        match_data = row.get("matches", {})
+        if match_data.get("status") != "FINISHED":
+            continue
+        actual = match_data.get("result")
+        if not actual:
+            continue
+
+        correct = actual == row["predicted_result"]
+        sb.table("predictions").update(
+            {"actual_result": actual, "correct": correct}
+        ).eq("match_id", row["match_id"]).execute()
+        finished_match_ids.append((row["match_id"], actual))
+        updated += 1
+
+    # Atualiza apostas pendentes cujos jogos terminaram
+    bets_updated = 0
+    for match_id, actual_result in finished_match_ids:
+        bets_resp = (
+            sb.table("user_bets")
+            .select("id, bet_outcome")
+            .eq("match_id", match_id)
+            .eq("status", "pending")
+            .execute()
+        )
+        for bet in bets_resp.data:
+            new_status = "won" if bet["bet_outcome"] == actual_result else "lost"
+            sb.table("user_bets").update({"status": new_status}).eq("id", bet["id"]).execute()
+            bets_updated += 1
+
+    return {"updated": updated, "bets_updated": bets_updated}
+
+
+# ── Retreinamento com status ───────────────────────────────────────────────────
+
+@app.post("/api/retrain")
+def retrain(background_tasks: BackgroundTasks, _=Depends(verify_admin)):
+    """Retreina o modelo completo: build_features --all + train_model. Retorna imediatamente."""
+    with _retrain_lock:
+        if _retrain_state["status"] == "running":
+            raise HTTPException(409, "Treinamento já em andamento")
+        _retrain_state.update({
+            "status": "running",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": None,
+            "error": None,
+        })
+
+    def _run():
+        try:
+            log.info("Retreinamento iniciado: build_features --all")
+            subprocess.run(["python", "scripts/build_features.py", "--all"], check=True)
+            log.info("Retreinamento: train_model")
+            subprocess.run(["python", "scripts/train_model.py"], check=True)
+            load_models()
+            with _retrain_lock:
+                _retrain_state.update({
+                    "status": "done",
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                })
+            log.info("Retreinamento concluído")
+        except Exception as e:
+            with _retrain_lock:
+                _retrain_state.update({"status": "error", "error": str(e)})
+            log.error(f"Retreinamento falhou: {e}")
+
+    background_tasks.add_task(_run)
+    return {"status": "running"}
+
+
+@app.get("/api/retrain/status")
+def retrain_status(_=Depends(verify_admin)):
+    """Retorna o estado atual do retreinamento."""
+    with _retrain_lock:
+        return dict(_retrain_state)
+
+
+# ── Apostas (Bankroll Tracker) ────────────────────────────────────────────────
+
+class BetCreate(BaseModel):
+    match_id: int
+    bet_outcome: Literal["H", "D", "A"]
+    odd: float
+    stake: float
+    notes: str | None = None
+
+
+@app.get("/api/bets")
+def list_bets(sb: Client = Depends(get_supabase)):
+    """Lista todas as apostas do usuário com dados do jogo."""
+    resp = (
+        sb.table("user_bets")
+        .select("*, matches!inner(match_date, status, result, home_team:home_team_id(name), away_team:away_team_id(name))")
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return {"bets": resp.data}
+
+
+@app.post("/api/bets")
+def create_bet(req: BetCreate, sb: Client = Depends(get_supabase)):
+    """Registra uma nova aposta, capturando snapshot das probabilidades do modelo."""
+    pred_resp = (
+        sb.table("predictions")
+        .select("prob_home, prob_draw, prob_away, predicted_result")
+        .eq("match_id", req.match_id)
+        .maybe_single()
+        .execute()
+    )
+    pred = pred_resp.data or {}
+    prob_map = {"H": pred.get("prob_home"), "D": pred.get("prob_draw"), "A": pred.get("prob_away")}
+
+    data = {
+        "match_id": req.match_id,
+        "bet_outcome": req.bet_outcome,
+        "odd": req.odd,
+        "stake": req.stake,
+        "notes": req.notes,
+        "model_prob": prob_map.get(req.bet_outcome),
+        "model_pick": pred.get("predicted_result"),
+    }
+    resp = sb.table("user_bets").insert(data).execute()
+    return resp.data[0]
+
+
+@app.delete("/api/bets/{bet_id}")
+def delete_bet(bet_id: str, sb: Client = Depends(get_supabase)):
+    """Remove uma aposta."""
+    sb.table("user_bets").delete().eq("id", bet_id).execute()
+    return {"deleted": bet_id}
+
+
+@app.get("/api/bets/metrics")
+def bets_metrics(sb: Client = Depends(get_supabase)):
+    """Métricas de bankroll: ROI, acerto, lucro/prejuízo, acordo com modelo."""
+    resp = sb.table("user_bets").select("stake, odd, status, bet_outcome, model_pick").execute()
+    bets = resp.data
+    total = len(bets)
+    if total == 0:
+        return {
+            "total_bets": 0, "won": 0, "lost": 0, "pending": 0,
+            "total_stake": 0, "profit_loss": 0, "roi_pct": None,
+            "model_agreement_pct": None,
+        }
+
+    won = sum(1 for b in bets if b["status"] == "won")
+    lost = sum(1 for b in bets if b["status"] == "lost")
+    resolved = won + lost
+    total_stake = sum(float(b["stake"]) for b in bets)
+    total_pl = sum(
+        float(b["stake"]) * float(b["odd"]) - float(b["stake"]) if b["status"] == "won"
+        else -float(b["stake"]) if b["status"] == "lost"
+        else 0.0
+        for b in bets
+    )
+    stake_resolved = sum(float(b["stake"]) for b in bets if b["status"] in ("won", "lost"))
+    roi = (total_pl / stake_resolved * 100) if stake_resolved > 0 else None
+    model_agreement = (
+        sum(1 for b in bets if b["bet_outcome"] == b["model_pick"]) / total
+    )
+
+    return {
+        "total_bets": total,
+        "won": won,
+        "lost": lost,
+        "pending": total - won - lost,
+        "total_stake": round(total_stake, 2),
+        "profit_loss": round(total_pl, 2),
+        "roi_pct": round(roi, 2) if roi is not None else None,
+        "model_agreement_pct": round(model_agreement * 100, 1),
+    }
+
+
+# ── Odds de mercado (The Odds API) ────────────────────────────────────────────
+
+# Mapeamento de nomes: The Odds API → nomes no nosso banco
+_TEAM_NAME_MAP = {
+    "Remo":              "Clube do Remo",
+    "Vasco da Gama":     "CR Vasco da Gama",
+    "Vitoria":           "EC Vitória",
+    "Sao Paulo":         "São Paulo FC",
+    "Mirassol":          "Mirassol FC",
+    "Bahia":             "EC Bahia",
+    "Fluminense":        "Fluminense FC",
+    "Flamengo":          "CR Flamengo",
+    "Santos":            "Santos FC",
+    "Atletico Mineiro":  "CA Mineiro",
+    "Internacional":     "SC Internacional",
+    "Gremio":            "Grêmio FBPA",
+    "Grêmio":            "Grêmio FBPA",
+    "Atletico Paranaense": "CA Paranaense",
+    "Chapecoense":       "Chapecoense AF",
+    "Botafogo":          "Botafogo FR",
+    "Coritiba":          "Coritiba FBC",
+    "Cruzeiro":          "Cruzeiro EC",
+    "Bragantino-SP":     "RB Bragantino",
+    "Corinthians":       "SC Corinthians Paulista",
+    "Palmeiras":         "SE Palmeiras",
+}
+
+# Ordem de preferência das casas (menor margem primeiro)
+_BOOKMAKER_PRIORITY = [
+    "pinnacle", "betfair_ex_eu", "matchbook",
+    "williamhill", "betsson", "marathonbet",
+    "nordicbet", "unibet_nl", "unibet_fr", "unibet_se",
+]
+
+
+def _normalize(name: str) -> str:
+    return _TEAM_NAME_MAP.get(name, name)
+
+
+def _best_bookmaker(bookmakers: list) -> dict | None:
+    """Retorna o bookmaker de maior prioridade disponível."""
+    bk_map = {b["key"]: b for b in bookmakers}
+    for key in _BOOKMAKER_PRIORITY:
+        if key in bk_map:
+            return bk_map[key]
+    return bookmakers[0] if bookmakers else None
+
+
+@app.get("/api/odds")
+async def get_odds(sb: Client = Depends(get_supabase)):
+    """
+    Busca odds de mercado (h2h + totals) da The Odds API para o Brasileirão.
+    Complementa com cálculos Poisson do modelo para over 1.5 e BTTS.
+    """
+    api_key = os.environ.get("ODDS_API_KEY")
+    if not api_key:
+        raise HTTPException(503, "ODDS_API_KEY não configurada")
+
+    url = "https://api.the-odds-api.com/v4/sports/soccer_brazil_campeonato/odds"
+    params = {
+        "apiKey": api_key,
+        "regions": "eu",
+        "markets": "h2h,totals",
+        "oddsFormat": "decimal",
+    }
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(url, params=params)
+
+    if resp.status_code != 200:
+        raise HTTPException(502, f"The Odds API retornou {resp.status_code}")
+
+    games = resp.json()
+
+    # Busca predições com expected goals para os jogos disponíveis
+    preds_resp = (
+        sb.table("predictions")
+        .select("match_id, expected_goals_home, expected_goals_away, matches!inner(home_team:home_team_id(name), away_team:away_team_id(name), status)")
+        .in_("matches.status", ["TIMED", "SCHEDULED"])
+        .execute()
+    )
+    # Indexa por (home_team, away_team)
+    preds_map: dict[tuple, dict] = {}
+    for p in preds_resp.data:
+        m = p.get("matches", {})
+        ht = m.get("home_team", {}).get("name", "")
+        at = m.get("away_team", {}).get("name", "")
+        if ht and at:
+            preds_map[(ht.lower(), at.lower())] = p
+
+    result = []
+    for game in games:
+        home_raw = game["home_team"]
+        away_raw = game["away_team"]
+        home_name = _normalize(home_raw)
+        away_name = _normalize(away_raw)
+
+        # ── Agrega odds de TODAS as casas disponíveis ──────────────────────────
+        all_h2h_odds: list[dict] = []
+        all_totals_odds: list[dict] = []
+
+        for bk in game.get("bookmakers", []):
+            for market in bk.get("markets", []):
+                if market["key"] == "h2h":
+                    outcomes = {o["name"]: o["price"] for o in market["outcomes"]}
+                    o_home = outcomes.get(home_raw) or outcomes.get(home_name)
+                    o_away = outcomes.get(away_raw) or outcomes.get(away_name)
+                    o_draw = next((v for k, v in outcomes.items()
+                                   if k not in (home_raw, away_raw, home_name, away_name)), None)
+                    if o_home and o_away:
+                        all_h2h_odds.append({
+                            "bookmaker": bk["key"],
+                            "odd_home": o_home,
+                            "odd_draw": o_draw,
+                            "odd_away": o_away,
+                        })
+                elif market["key"] == "totals":
+                    over25 = under25 = None
+                    for o in market["outcomes"]:
+                        if o.get("point") == 2.5:
+                            if o["name"] == "Over":
+                                over25 = o["price"]
+                            elif o["name"] == "Under":
+                                under25 = o["price"]
+                    if over25 or under25:
+                        all_totals_odds.append({
+                            "bookmaker": bk["key"],
+                            "odd_over25": over25,
+                            "odd_under25": under25,
+                        })
+
+        # ── Melhor odd disponível (máximo entre casas) ─────────────────────────
+        best_odd_home  = max((b["odd_home"] for b in all_h2h_odds if b["odd_home"]), default=None)
+        best_odd_draw  = max((b["odd_draw"] for b in all_h2h_odds if b["odd_draw"]), default=None)
+        best_odd_away  = max((b["odd_away"] for b in all_h2h_odds if b["odd_away"]), default=None)
+        best_over25    = max((b["odd_over25"] for b in all_totals_odds if b["odd_over25"]), default=None)
+        best_under25   = max((b["odd_under25"] for b in all_totals_odds if b["odd_under25"]), default=None)
+
+        # Casa com melhor odd para H2H (preferência: Pinnacle)
+        bk_h2h = _best_bookmaker([b for b in game.get("bookmakers", [])
+                                   if any(m["key"] == "h2h" for m in b["markets"])])
+        bk_totals = _best_bookmaker([b for b in game.get("bookmakers", [])
+                                     if any(m["key"] == "totals" for m in b["markets"])])
+
+        # Casas que oferecem a melhor odd
+        def _best_bk_for(field: str, items: list) -> str | None:
+            best = max((b[field] for b in items if b.get(field)), default=None)
+            if best is None:
+                return None
+            for prio in _BOOKMAKER_PRIORITY:
+                if any(b["bookmaker"] == prio and b.get(field) == best for b in items):
+                    return prio
+            return next((b["bookmaker"] for b in items if b.get(field) == best), None)
+
+        # Cálculos Poisson do modelo
+        pred = preds_map.get((home_name.lower(), away_name.lower()))
+        model_over15 = model_over25 = model_btts = None
+        if pred and pred.get("expected_goals_home") and pred.get("expected_goals_away"):
+            lh = float(pred["expected_goals_home"])
+            la = float(pred["expected_goals_away"])
+            model_over15 = round(over_n_prob(lh, la, 1.5), 4)
+            model_over25 = round(over_n_prob(lh, la, 2.5), 4)
+            model_btts   = round(btts_prob(lh, la), 4)
+
+        result.append({
+            "home_team":          home_name,
+            "away_team":          away_name,
+            "commence_time":      game["commence_time"],
+            # H2H — melhor odd disponível entre todas as casas
+            "h2h_bookmaker":      bk_h2h["key"] if bk_h2h else None,
+            "odd_home":           best_odd_home,
+            "odd_draw":           best_odd_draw,
+            "odd_away":           best_odd_away,
+            "best_home_bk":       _best_bk_for("odd_home", all_h2h_odds),
+            "best_draw_bk":       _best_bk_for("odd_draw", all_h2h_odds),
+            "best_away_bk":       _best_bk_for("odd_away", all_h2h_odds),
+            # Totals de mercado (Over/Under 2.5)
+            "totals_bookmaker":   bk_totals["key"] if bk_totals else None,
+            "odd_over25_market":  best_over25,
+            "odd_under25_market": best_under25,
+            "best_over25_bk":     _best_bk_for("odd_over25", all_totals_odds),
+            "best_under25_bk":    _best_bk_for("odd_under25", all_totals_odds),
+            # Todas as casas (para comparação)
+            "all_h2h_odds":       all_h2h_odds,
+            "all_totals_odds":    all_totals_odds,
+            # Modelo Poisson
+            "model_over15":       model_over15,
+            "model_over25":       model_over25,
+            "model_btts":         model_btts,
+            # Fair odds do modelo
+            "fair_over15":        round(1 / model_over15, 2) if model_over15 else None,
+            "fair_over25":        round(1 / model_over25, 2) if model_over25 else None,
+            "fair_btts":          round(1 / model_btts,   2) if model_btts   else None,
+            "fair_under25":       round(1 / (1 - model_over25), 2) if model_over25 else None,
+            "fair_no_btts":       round(1 / (1 - model_btts),   2) if model_btts   else None,
+        })
+
+    # ── Salva snapshot no histórico (em background, ignora falhas) ────────────
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        snapshot_rows = []
+        for item in result:
+            # Busca match_id pelo nome dos times (join com upcoming_predictions)
+            match_row = next(
+                (p for p in preds_resp.data
+                 if (p.get("matches", {}).get("home_team", {}).get("name", "") == item["home_team"] and
+                     p.get("matches", {}).get("away_team", {}).get("name", "") == item["away_team"])),
+                None
+            )
+            match_id = match_row["match_id"] if match_row else None
+
+            # H2H rows por bookmaker
+            for bk_entry in item.get("all_h2h_odds", []):
+                for outcome, odd_val in [
+                    ("H", bk_entry.get("odd_home")),
+                    ("D", bk_entry.get("odd_draw")),
+                    ("A", bk_entry.get("odd_away")),
+                ]:
+                    if odd_val:
+                        snapshot_rows.append({
+                            "match_id": match_id,
+                            "bookmaker": bk_entry["bookmaker"],
+                            "market": "h2h",
+                            "outcome": outcome,
+                            "odd": odd_val,
+                            "captured_at": now_iso,
+                        })
+
+            # Totals rows por bookmaker
+            for bk_entry in item.get("all_totals_odds", []):
+                if bk_entry.get("odd_over25"):
+                    snapshot_rows.append({
+                        "match_id": match_id,
+                        "bookmaker": bk_entry["bookmaker"],
+                        "market": "totals",
+                        "outcome": "over25",
+                        "odd": bk_entry["odd_over25"],
+                        "captured_at": now_iso,
+                    })
+                if bk_entry.get("odd_under25"):
+                    snapshot_rows.append({
+                        "match_id": match_id,
+                        "bookmaker": bk_entry["bookmaker"],
+                        "market": "totals",
+                        "outcome": "under25",
+                        "odd": bk_entry["odd_under25"],
+                        "captured_at": now_iso,
+                    })
+
+        if snapshot_rows:
+            sb.table("odds_history").insert(snapshot_rows).execute()
+            log.info(f"  Snapshot de odds salvo: {len(snapshot_rows)} linhas")
+    except Exception as e:
+        log.warning(f"  Falha ao salvar snapshot de odds: {e}")
+
+    return {"odds": result, "count": len(result)}
+
+
+@app.get("/api/odds/history")
+def get_odds_history(
+    home_team: str | None = None,
+    away_team: str | None = None,
+    market: str = "h2h",
+    outcome: str = "H",
+    limit: int = 200,
+    sb: Client = Depends(get_supabase),
+):
+    """Histórico de odds para um jogo/mercado específico."""
+    query = (
+        sb.table("odds_history")
+        .select("*")
+        .eq("market", market)
+        .eq("outcome", outcome)
+        .order("captured_at", desc=True)
+        .limit(limit)
+    )
+    if home_team:
+        query = query.eq("home_team", home_team)
+    if away_team:
+        query = query.eq("away_team", away_team)
+
+    resp = query.execute()
+    return {"history": resp.data, "count": len(resp.data)}
+
+
+# ── Análise por time ──────────────────────────────────────────────────────────
+
+@app.get("/api/teams")
+def list_teams(sb: Client = Depends(get_supabase)):
+    """Lista todos os times com dados da temporada atual."""
+    resp = sb.table("teams").select("id, name").order("name").execute()
+    return {"teams": resp.data}
+
+
+@app.get("/api/teams/{team_name}/profile")
+def team_profile(team_name: str, season: int = 2026, sb: Client = Depends(get_supabase)):
+    """
+    Perfil completo de um time: forma recente, gols esperados,
+    rendimento casa/fora e próximos jogos com predição.
+    """
+    # Busca o time
+    team_resp = sb.table("teams").select("id, name").ilike("name", f"%{team_name}%").limit(1).execute()
+    if not team_resp.data:
+        raise HTTPException(404, f"Time não encontrado: {team_name}")
+    team = team_resp.data[0]
+    team_id = team["id"]
+
+    # Últimas 10 partidas disputadas (com resultado)
+    home_resp = (
+        sb.table("matches")
+        .select("id, match_date, matchday, result, home_goals, away_goals, status, away_team:away_team_id(name)")
+        .eq("home_team_id", team_id)
+        .eq("season", season)
+        .eq("status", "FINISHED")
+        .order("match_date", desc=True)
+        .limit(10)
+        .execute()
+    )
+    away_resp = (
+        sb.table("matches")
+        .select("id, match_date, matchday, result, home_goals, away_goals, status, home_team:home_team_id(name)")
+        .eq("away_team_id", team_id)
+        .eq("season", season)
+        .eq("status", "FINISHED")
+        .order("match_date", desc=True)
+        .limit(10)
+        .execute()
+    )
+
+    home_matches = [
+        {**m, "venue": "home", "opponent": m.pop("away_team", {}).get("name", ""),
+         "team_goals": m["home_goals"], "opp_goals": m["away_goals"],
+         "pts": 3 if m["result"] == "H" else 1 if m["result"] == "D" else 0}
+        for m in home_resp.data
+    ]
+    away_matches = [
+        {**m, "venue": "away", "opponent": m.pop("home_team", {}).get("name", ""),
+         "team_goals": m["away_goals"], "opp_goals": m["home_goals"],
+         "pts": 3 if m["result"] == "A" else 1 if m["result"] == "D" else 0}
+        for m in away_resp.data
+    ]
+
+    all_matches = sorted(home_matches + away_matches, key=lambda x: x["match_date"], reverse=True)[:10]
+
+    # Próximos jogos com predição
+    next_home = (
+        sb.table("upcoming_predictions")
+        .select("*")
+        .eq("home_team", team["name"])
+        .limit(3)
+        .execute()
+    )
+    next_away = (
+        sb.table("upcoming_predictions")
+        .select("*")
+        .eq("away_team", team["name"])
+        .limit(3)
+        .execute()
+    )
+    upcoming = sorted(
+        next_home.data + next_away.data,
+        key=lambda x: x.get("match_date", "")
+    )[:5]
+
+    # Features mais recentes do time (para forma atual)
+    feat_home = (
+        sb.table("match_features")
+        .select("home_form_pts,home_form_gf,home_form_ga,home_home_pts,home_home_gf,home_home_ga,home_table_pos,home_table_pts,home_avg_xg,home_avg_xga,matches!inner(match_date,status)")
+        .eq("matches.status", "SCHEDULED")
+        .execute()
+    )
+    # Pega features mais recentes para este time como mandante
+    latest_feat = next(
+        (f for f in sorted(feat_home.data, key=lambda x: x.get("matches", {}).get("match_date", ""), reverse=True)
+         if True), None
+    )
+
+    # Resumo estatístico
+    def stats(matches: list, venue: str | None = None):
+        ms = [m for m in matches if venue is None or m["venue"] == venue]
+        if not ms:
+            return {"jogos": 0, "pts": 0, "gf": 0, "ga": 0, "wins": 0, "draws": 0, "losses": 0}
+        pts_total = sum(m["pts"] for m in ms)
+        gf = sum(m.get("team_goals", 0) or 0 for m in ms)
+        ga = sum(m.get("opp_goals", 0) or 0 for m in ms)
+        wins = sum(1 for m in ms if m["pts"] == 3)
+        draws = sum(1 for m in ms if m["pts"] == 1)
+        losses = sum(1 for m in ms if m["pts"] == 0)
+        return {
+            "jogos": len(ms), "pts": pts_total, "pts_pj": round(pts_total / len(ms), 2),
+            "gf": gf, "ga": ga, "gf_pj": round(gf / len(ms), 2), "ga_pj": round(ga / len(ms), 2),
+            "wins": wins, "draws": draws, "losses": losses,
+        }
+
+    return {
+        "team": team,
+        "season": season,
+        "recent_matches": all_matches,
+        "upcoming": upcoming,
+        "stats_overall": stats(all_matches),
+        "stats_home": stats(home_matches),
+        "stats_away": stats(away_matches),
+        "features": latest_feat,
+    }
+
+
+# ── Lesões, suspensões e escalações (#4 e #8) ────────────────────────────────
+
+# Impacto estimado por posição no λ (gols esperados):
+# Ausência de titular reduz capacidade ofensiva/defensiva.
+_INJURY_IMPACT = {
+    "Goalkeeper":    {"home_ga": +0.08, "away_ga": +0.08},   # goleiro ausente → mais gols sofridos
+    "Defender":      {"home_ga": +0.06, "away_ga": +0.06},
+    "Midfielder":    {"home_gf": -0.05, "home_ga": +0.03, "away_gf": -0.05, "away_ga": +0.03},
+    "Attacker":      {"home_gf": -0.10, "away_gf": -0.10},
+    "Forward":       {"home_gf": -0.10, "away_gf": -0.10},
+}
+
+
+def _apply_injury_adjustment(
+    lambda_home: float,
+    lambda_away: float,
+    home_injuries: list[dict],
+    away_injuries: list[dict],
+) -> tuple[float, float]:
+    """
+    Ajusta λ_home e λ_away com base nas ausências confirmadas.
+    Cada jogador ausente modifica os lambdas de acordo com a posição.
+    """
+    for inj in home_injuries:
+        pos = inj.get("player_position", "")
+        impact = _INJURY_IMPACT.get(pos, {})
+        lambda_home = max(0.1, lambda_home + impact.get("home_gf", 0))
+        lambda_away = max(0.1, lambda_away - impact.get("home_ga", 0) * -1)
+
+    for inj in away_injuries:
+        pos = inj.get("player_position", "")
+        impact = _INJURY_IMPACT.get(pos, {})
+        lambda_away = max(0.1, lambda_away + impact.get("away_gf", 0))
+        lambda_home = max(0.1, lambda_home - impact.get("away_ga", 0) * -1)
+
+    return lambda_home, lambda_away
+
+
+@app.get("/api/injuries/{match_id}")
+def get_injuries(match_id: int, sb: Client = Depends(get_supabase)):
+    """Retorna lesões/suspensões registradas para um jogo."""
+    resp = (
+        sb.table("player_injuries")
+        .select("*, teams!inner(name)")
+        .eq("match_id", match_id)
+        .order("player_position")
+        .execute()
+    )
+    return {"injuries": resp.data, "count": len(resp.data)}
+
+
+@app.get("/api/lineups/{match_id}")
+def get_lineups(match_id: int, sb: Client = Depends(get_supabase)):
+    """Retorna escalações confirmadas para um jogo."""
+    resp = (
+        sb.table("match_lineups")
+        .select("*, teams!inner(name)")
+        .eq("match_id", match_id)
+        .execute()
+    )
+    return {"lineups": resp.data, "confirmed": any(r.get("is_confirmed") for r in resp.data)}
+
+
+@app.post("/api/predict/with-lineup/{match_id}")
+def predict_with_lineup(match_id: int, sb: Client = Depends(get_supabase)):
+    """
+    Recalcula probabilidades levando em conta lesões/escalações confirmadas.
+    Retorna predição original + predição ajustada + delta.
+    Ideal para rodar ~1h antes do jogo quando escalações estão confirmadas.
+    """
+    # Busca features do jogo
+    feat_resp = (
+        sb.table("match_features")
+        .select("*")
+        .eq("match_id", match_id)
+        .maybe_single()
+        .execute()
+    )
+    if not feat_resp.data:
+        raise HTTPException(404, f"Features não encontradas para match_id={match_id}")
+
+    features = feat_resp.data
+
+    # Predição base (sem ajuste)
+    base_pred = predict_from_features(features)
+    lh_base = base_pred["expected_goals_home"]
+    la_base = base_pred["expected_goals_away"]
+
+    # Busca o time mandante e visitante
+    match_resp = sb.table("matches").select("home_team_id, away_team_id").eq("id", match_id).execute()
+    if not match_resp.data:
+        raise HTTPException(404, f"Jogo {match_id} não encontrado")
+
+    home_team_id = match_resp.data[0]["home_team_id"]
+    away_team_id = match_resp.data[0]["away_team_id"]
+
+    # Busca lesões por time
+    inj_home = (
+        sb.table("player_injuries")
+        .select("player_name, player_position, injury_type")
+        .eq("match_id", match_id)
+        .eq("team_id", home_team_id)
+        .execute()
+    ).data or []
+
+    inj_away = (
+        sb.table("player_injuries")
+        .select("player_name, player_position, injury_type")
+        .eq("match_id", match_id)
+        .eq("team_id", away_team_id)
+        .execute()
+    ).data or []
+
+    # Busca info de escalação (key_players_out)
+    lu_home_resp = (
+        sb.table("match_lineups")
+        .select("is_confirmed, key_players_out")
+        .eq("match_id", match_id)
+        .eq("team_id", home_team_id)
+        .execute()
+    )
+    lu_away_resp = (
+        sb.table("match_lineups")
+        .select("is_confirmed, key_players_out")
+        .eq("match_id", match_id)
+        .eq("team_id", away_team_id)
+        .execute()
+    )
+    lineup_home = lu_home_resp.data[0] if lu_home_resp.data else None
+    lineup_away = lu_away_resp.data[0] if lu_away_resp.data else None
+
+    # Aplica ajuste
+    lh_adj, la_adj = _apply_injury_adjustment(lh_base, la_base, inj_home, inj_away)
+
+    # Recalcula probabilidades com lambdas ajustados via Dixon-Coles
+    dc_h, dc_d, dc_a = result_probs_dc(lh_adj, la_adj)
+
+    # Blend: 70% predição base (XGBoost já calibrado) + 30% DC ajustado
+    ADJ_WEIGHT = 0.30
+    adj_h = (1 - ADJ_WEIGHT) * base_pred["prob_home"] + ADJ_WEIGHT * dc_h
+    adj_d = (1 - ADJ_WEIGHT) * base_pred["prob_draw"] + ADJ_WEIGHT * dc_d
+    adj_a = (1 - ADJ_WEIGHT) * base_pred["prob_away"] + ADJ_WEIGHT * dc_a
+
+    # Normaliza
+    total = adj_h + adj_d + adj_a
+    adj_h, adj_d, adj_a = adj_h / total, adj_d / total, adj_a / total
+
+    lineup_confirmed = (lineup_home and lineup_home.get("is_confirmed")) or \
+                       (lineup_away and lineup_away.get("is_confirmed"))
+
+    return {
+        "match_id": match_id,
+        "lineup_confirmed": lineup_confirmed,
+        "injuries": {
+            "home": inj_home,
+            "away": inj_away,
+            "home_key_out": lineup_home.get("key_players_out", 0) if lineup_home else len(inj_home),
+            "away_key_out": lineup_away.get("key_players_out", 0) if lineup_away else len(inj_away),
+        },
+        "base_prediction": {
+            "prob_home": base_pred["prob_home"],
+            "prob_draw": base_pred["prob_draw"],
+            "prob_away": base_pred["prob_away"],
+            "expected_goals_home": lh_base,
+            "expected_goals_away": la_base,
+        },
+        "adjusted_prediction": {
+            "prob_home": round(adj_h, 4),
+            "prob_draw": round(adj_d, 4),
+            "prob_away": round(adj_a, 4),
+            "expected_goals_home": round(lh_adj, 2),
+            "expected_goals_away": round(la_adj, 2),
+            "over_25_prob": round(over25_prob(lh_adj, la_adj), 3),
+        },
+        "delta": {
+            "prob_home": round(adj_h - base_pred["prob_home"], 4),
+            "prob_draw": round(adj_d - base_pred["prob_draw"], 4),
+            "prob_away": round(adj_a - base_pred["prob_away"], 4),
+        },
+    }
+
+
+@app.post("/api/collect-injuries")
+def trigger_collect_injuries(
+    background_tasks: BackgroundTasks,
+    hours: int = 72,
+    lineups_only: bool = False,
+    _=Depends(verify_admin),
+):
+    """Dispara coleta de lesões/escalações via API-Football em background."""
+    def _run():
+        args = ["python", "scripts/collect_injuries.py", f"--hours={hours}"]
+        if lineups_only:
+            args.append("--lineups")
+        subprocess.run(args, check=True)
+        log.info("Coleta de lesões/escalações concluída")
+
+    background_tasks.add_task(_run)
+    return {"status": f"Coleta iniciada (janela: {hours}h, só_lineups={lineups_only})"}
+
+
+# ── ETL ───────────────────────────────────────────────────────────────────────
+
+@app.post("/api/run-etl")
+def run_etl(background_tasks: BackgroundTasks, _=Depends(verify_admin)):
+    """Dispara coleta de dados + recálculo de features em background."""
+    def _run():
+        subprocess.run(["python", "scripts/collect_data.py", "--incremental"], check=True)
+        subprocess.run(["python", "scripts/build_features.py", "--upcoming"], check=True)
+        log.info("ETL concluído")
+
+    background_tasks.add_task(_run)
+    return {"status": "ETL iniciado em background"}
+
+
+# ── Entrypoint ─────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=False)
