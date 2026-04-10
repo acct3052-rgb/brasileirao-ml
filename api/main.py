@@ -328,6 +328,16 @@ def get_accuracy(sb: Client = Depends(get_supabase)):
     return resp.data[0] if resp.data else {"total_predictions": 0, "accuracy_pct": None}
 
 
+@app.get("/api/accuracy/by-round")
+def get_accuracy_by_round(season: int | None = None, sb: Client = Depends(get_supabase)):
+    """Acurácia do modelo por rodada."""
+    query = sb.table("round_accuracy").select("*")
+    if season:
+        query = query.eq("season", season)
+    resp = query.order("season", desc=True).order("matchday", desc=True).execute()
+    return {"rounds": resp.data, "count": len(resp.data)}
+
+
 @app.get("/api/predictions/recent")
 def get_recent_predictions(limit: int = 20, sb: Client = Depends(get_supabase)):
     """Últimas predições com resultado real (para validação)."""
