@@ -381,15 +381,14 @@ def predict_match(req: PredictRequest, sb: Client = Depends(get_supabase)):
 
 
 @app.post("/api/predict/batch")
-def predict_batch(sb: Client = Depends(get_supabase)):
+def predict_batch(season: int | None = None, sb: Client = Depends(get_supabase)):
     if not models.get("result_model"):
         raise HTTPException(503, "Modelo não carregado")
 
-    resp = (
-        sb.table("match_features")
-        .select("*, matches!inner(status)")
-        .execute()
-    )
+    query = sb.table("match_features").select("*, matches!inner(status, season)")
+    if season:
+        query = query.eq("season", season)
+    resp = query.execute()
 
     predicted_ids = {
         r["match_id"] for r in sb.table("predictions").select("match_id").execute().data
@@ -398,7 +397,10 @@ def predict_batch(sb: Client = Depends(get_supabase)):
     to_predict = [
         r for r in resp.data
         if r["match_id"] not in predicted_ids
-        and r.get("matches", {}).get("status") in ("SCHEDULED", "TIMED")
+        and (
+            season is not None  # retroativo: ignora filtro de status
+            or r.get("matches", {}).get("status") in ("SCHEDULED", "TIMED")
+        )
     ]
 
     results = []
