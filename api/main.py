@@ -295,6 +295,7 @@ def predict_from_features(features: dict) -> dict:
         "expected_goals_home":    round(lambda_home, 2),
         "expected_goals_away":    round(lambda_away, 2),
         "expected_total_goals":   round(lambda_home + lambda_away, 2),
+        "over_15_prob":           round(over_n_prob(lambda_home, lambda_away, 1.5), 3),
         "over_25_prob":           round(over25_prob(lambda_home, lambda_away), 3),
     }
 
