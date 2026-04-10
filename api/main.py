@@ -1211,6 +1211,109 @@ def run_etl(background_tasks: BackgroundTasks, _=Depends(verify_admin)):
     return {"status": "ETL iniciado em background"}
 
 
+@app.post("/api/sync-results")
+def sync_results(sb: Client = Depends(get_supabase)):
+    """
+    Busca resultados reais na football-data.org e atualiza o Supabase,
+    depois marca predições e apostas como corretas/erradas.
+    Endpoint público — não precisa de token.
+    """
+    import requests as req
+
+    football_key = os.environ.get("FOOTBALL_DATA_API_KEY", "")
+    etl_updated = 0
+    etl_error = None
+
+    # ── 1. ETL: busca placares finalizados na football-data.org ────────────────
+    if football_key:
+        try:
+            season = datetime.now(timezone.utc).year
+            url = f"https://api.football-data.org/v4/competitions/BSA/matches?season={season}&status=FINISHED"
+            resp = req.get(url, headers={"X-Auth-Token": football_key}, timeout=30)
+            resp.raise_for_status()
+            finished = resp.json().get("matches", [])
+            log.info(f"sync-results: {len(finished)} jogos finalizados na API externa")
+
+            for m in finished:
+                ext_id = str(m["id"])
+                score = m.get("score", {}).get("fullTime", {})
+                hg = score.get("home")
+                ag = score.get("away")
+                if hg is None or ag is None:
+                    continue
+
+                result = "H" if hg > ag else ("A" if ag > hg else "D")
+
+                # Verifica se já está atualizado
+                existing = sb.table("matches").select("id, status, result").eq("id", int(ext_id)).execute()
+                if not existing.data:
+                    continue
+                row = existing.data[0]
+                if row.get("status") == "FINISHED" and row.get("result") == result:
+                    continue  # já atualizado
+
+                sb.table("matches").update({
+                    "home_goals": hg,
+                    "away_goals": ag,
+                    "result": result,
+                    "status": "FINISHED",
+                }).eq("id", int(ext_id)).execute()
+                etl_updated += 1
+
+        except Exception as e:
+            etl_error = str(e)
+            log.warning(f"sync-results ETL erro: {e}")
+    else:
+        etl_error = "FOOTBALL_DATA_API_KEY não configurada"
+        log.warning("sync-results: FOOTBALL_DATA_API_KEY não configurada")
+
+    # ── 2. Atualiza predições ──────────────────────────────────────────────────
+    resp = (
+        sb.table("predictions")
+        .select("match_id, predicted_result, matches!inner(result, status)")
+        .is_("actual_result", "null")
+        .execute()
+    )
+
+    predictions_updated = 0
+    finished_match_ids = []
+    for row in resp.data:
+        match_data = row.get("matches", {})
+        if match_data.get("status") != "FINISHED":
+            continue
+        actual = match_data.get("result")
+        if not actual:
+            continue
+        correct = actual == row["predicted_result"]
+        sb.table("predictions").update(
+            {"actual_result": actual, "correct": correct}
+        ).eq("match_id", row["match_id"]).execute()
+        finished_match_ids.append((row["match_id"], actual))
+        predictions_updated += 1
+
+    # ── 3. Atualiza apostas ────────────────────────────────────────────────────
+    bets_updated = 0
+    for match_id, actual_result in finished_match_ids:
+        bets_resp = (
+            sb.table("user_bets")
+            .select("id, bet_outcome")
+            .eq("match_id", match_id)
+            .eq("status", "pending")
+            .execute()
+        )
+        for bet in bets_resp.data:
+            new_status = "won" if bet["bet_outcome"] == actual_result else "lost"
+            sb.table("user_bets").update({"status": new_status}).eq("id", bet["id"]).execute()
+            bets_updated += 1
+
+    return {
+        "matches_synced": etl_updated,
+        "predictions_updated": predictions_updated,
+        "bets_updated": bets_updated,
+        "etl_error": etl_error,
+    }
+
+
 # ── Entrypoint ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
