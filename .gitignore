@@ -13,8 +13,8 @@ __pycache__/
 .venv/
 venv/
 
-# Modelos treinados
-models/
+# Modelos com timestamp (manter apenas _latest)
+models/*_2026*.pkl
 
 # Dados locais
 data/
