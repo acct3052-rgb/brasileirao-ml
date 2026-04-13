@@ -338,6 +338,27 @@ def get_accuracy_by_round(season: int | None = None, sb: Client = Depends(get_su
     return {"rounds": resp.data, "count": len(resp.data)}
 
 
+@app.get("/api/accuracy/calibration")
+def get_calibration(sb: Client = Depends(get_supabase)):
+    """
+    Retorna a acurácia real por faixa de confiança do modelo.
+    Usado para calibrar o nível de destaque nos cards.
+    """
+    resp = sb.table("confidence_calibration").select("*").order("confidence_bucket").execute()
+    # Monta lookup: dado confidence 0.0-1.0 → acurácia real histórica
+    calibration = []
+    for r in resp.data:
+        calibration.append({
+            "confidence_min": round(float(r["confidence_bucket"]) / 100 - 0.05, 2),
+            "confidence_max": round(float(r["confidence_bucket"]) / 100 + 0.05, 2),
+            "confidence_bucket_pct": float(r["confidence_bucket"]),
+            "total": r["total"],
+            "correct": r["correct"],
+            "actual_accuracy_pct": float(r["actual_accuracy_pct"]),
+        })
+    return {"calibration": calibration}
+
+
 @app.get("/api/predictions/recent")
 def get_recent_predictions(limit: int = 20, sb: Client = Depends(get_supabase)):
     """Últimas predições com resultado real (para validação)."""
@@ -1325,6 +1346,139 @@ def sync_results(sb: Client = Depends(get_supabase)):
         "bets_updated": bets_updated,
         "etl_error": etl_error,
     }
+
+
+# ── Chat com Claude ────────────────────────────────────────────────────────────
+
+class ChatRequest(BaseModel):
+    message: str
+
+def _build_chat_context(message: str, sb: Client) -> str:
+    """
+    Detecta o tema da pergunta e busca só os dados relevantes.
+    Mantém o contexto pequeno para economizar tokens.
+    """
+    msg = message.lower()
+    parts: list[str] = []
+
+    # Sempre inclui data atual
+    hoje = datetime.now(timezone.utc).strftime("%d/%m/%Y")
+    parts.append(f"Data atual: {hoje}")
+
+    # Fixtures de hoje / próximos jogos
+    if any(w in msg for w in ["hoje", "jogo", "aposta", "melhor", "ouro", "over", "xg", "gol", "confia", "rodada", "próxim"]):
+        try:
+            rows = (
+                sb.table("upcoming_predictions")
+                .select("match_id,match_date,matchday,home_team,away_team,prob_home,prob_draw,prob_away,predicted_result,confidence,expected_goals_home,expected_goals_away,over_15_prob,over_25_prob")
+                .order("match_date")
+                .limit(20)
+                .execute()
+            ).data or []
+            if rows:
+                lines = ["PRÓXIMOS JOGOS (predições do modelo):"]
+                for r in rows:
+                    ph = round((r.get("prob_home") or 0) * 100)
+                    pd_ = round((r.get("prob_draw") or 0) * 100)
+                    pa = round((r.get("prob_away") or 0) * 100)
+                    conf = round((r.get("confidence") or 0) * 100)
+                    o15 = round((r.get("over_15_prob") or 0) * 100)
+                    o25 = round((r.get("over_25_prob") or 0) * 100)
+                    xgh = r.get("expected_goals_home") or 0
+                    xga = r.get("expected_goals_away") or 0
+                    tier = "Elite" if conf >= 70 else "Alta" if conf >= 60 else "Média" if conf >= 50 else "Baixa"
+                    lines.append(
+                        f"Rd{r['matchday']} {r['match_date'][:10]} | {r['home_team']} vs {r['away_team']} | "
+                        f"H:{ph}% D:{pd_}% A:{pa}% | prev:{r['predicted_result']} conf:{conf}% ({tier}) | "
+                        f"xG:{xgh:.1f}-{xga:.1f} | O1.5:{o15}% O2.5:{o25}%"
+                    )
+                parts.append("\n".join(lines))
+        except Exception as e:
+            log.warning(f"chat context fixtures: {e}")
+
+    # Acurácia geral
+    if any(w in msg for w in ["precisão", "acurácia", "acerto", "errou", "acertou", "histór", "resultado", "modelo"]):
+        try:
+            acc = (sb.table("predictions").select("correct").not_.is_("correct", "null").execute()).data or []
+            if acc:
+                total = len(acc)
+                certos = sum(1 for r in acc if r["correct"])
+                parts.append(f"ACURÁCIA GERAL: {certos}/{total} = {round(certos/total*100, 1)}% de acerto histórico")
+        except Exception as e:
+            log.warning(f"chat context accuracy: {e}")
+
+    # Acurácia por rodada (últimas 5)
+    if any(w in msg for w in ["rodada", "round", "última", "recente"]):
+        try:
+            rows = (
+                sb.table("round_accuracy")
+                .select("season,matchday,total,correct,accuracy")
+                .order("season", desc=True)
+                .order("matchday", desc=True)
+                .limit(5)
+                .execute()
+            ).data or []
+            if rows:
+                lines = ["ACURÁCIA POR RODADA (últimas 5):"]
+                for r in rows:
+                    lines.append(f"  {r['season']} Rd{r['matchday']}: {r['correct']}/{r['total']} = {round((r['accuracy'] or 0)*100)}%")
+                parts.append("\n".join(lines))
+        except Exception as e:
+            log.warning(f"chat context round_accuracy: {e}")
+
+    # Calibração
+    if any(w in msg for w in ["elite", "alta", "calibr", "confia", "tier", "faixa"]):
+        parts.append(
+            "CALIBRAÇÃO DO MODELO (dados reais 2023-2026):\n"
+            "  Elite (≥70% conf): 88.3% acerto histórico — 60 jogos\n"
+            "  Alta  (≥60% conf): 73.5% acerto histórico — 238 jogos\n"
+            "  Média (≥50% conf): 52.9% acerto histórico — 548 jogos\n"
+            "  Baixa (<50% conf): 47.8% acerto histórico — 638 jogos"
+        )
+
+    return "\n\n".join(parts)
+
+
+SYSTEM_PROMPT = """Você é o assistente do Brasileirão ML, um sistema de predição de jogos do Campeonato Brasileiro.
+
+Seu papel:
+- Responder perguntas sobre predições, apostas, acurácia e análise dos jogos
+- Ser direto e preciso — máximo 3-4 linhas por resposta
+- Usar os dados fornecidos no contexto, nunca inventar números
+- Destacar apostas de alto valor (Elite + EV positivo) quando relevante
+- Falar em português brasileiro
+
+Regras:
+- Não recomendar apostas de forma irresponsável
+- Se não tiver dados suficientes, dizer claramente
+- Não repetir o contexto inteiro, só o que responde a pergunta"""
+
+
+@app.post("/api/chat")
+async def chat(req: ChatRequest, sb: Client = Depends(get_supabase)):
+    """Chat com Claude Haiku usando contexto dos dados do sistema."""
+    import anthropic
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise HTTPException(503, "ANTHROPIC_API_KEY não configurada")
+
+    context = _build_chat_context(req.message, sb)
+
+    client = anthropic.Anthropic(api_key=api_key)
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=300,
+        system=SYSTEM_PROMPT,
+        messages=[
+            {
+                "role": "user",
+                "content": f"Contexto do sistema:\n{context}\n\nPergunta: {req.message}"
+            }
+        ]
+    )
+
+    return {"reply": response.content[0].text}
 
 
 # ── Entrypoint ─────────────────────────────────────────────────────────────────
