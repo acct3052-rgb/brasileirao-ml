@@ -1482,8 +1482,8 @@ def _build_chat_context(message: str, sb: Client) -> str:
     hoje = datetime.now(timezone.utc).strftime("%d/%m/%Y")
     parts.append(f"Data atual: {hoje}")
 
-    # Fixtures de hoje / próximos jogos
-    if any(w in msg for w in ["hoje", "jogo", "aposta", "melhor", "ouro", "over", "xg", "gol", "confia", "rodada", "próxim"]):
+    # Fixtures + odds de mercado + EV calculado
+    if any(w in msg for w in ["hoje", "jogo", "aposta", "melhor", "ouro", "over", "xg", "gol", "confia", "rodada", "próxim", "elite", "ev", "valor"]):
         try:
             rows = (
                 sb.table("upcoming_predictions")
@@ -1492,22 +1492,57 @@ def _build_chat_context(message: str, sb: Client) -> str:
                 .limit(20)
                 .execute()
             ).data or []
+
+            # Busca odds de mercado
+            odds_rows = (
+                sb.table("market_odds")
+                .select("home_team,away_team,odd_home,odd_draw,odd_away,odd_over25_market")
+                .execute()
+            ).data or []
+
+            # Monta lookup de odds por times normalizados
+            def _norm(s: str) -> str:
+                import unicodedata
+                s = unicodedata.normalize('NFD', s.lower())
+                s = ''.join(c for c in s if unicodedata.category(c) != 'Mn')
+                return s.replace(' ', '')
+
+            odds_map: dict = {}
+            for o in odds_rows:
+                key = (_norm(o.get("home_team", "")), _norm(o.get("away_team", "")))
+                odds_map[key] = o
+
             if rows:
-                lines = ["PRÓXIMOS JOGOS (predições do modelo):"]
+                lines = ["PRÓXIMOS JOGOS com odds e EV:"]
                 for r in rows:
-                    ph = round((r.get("prob_home") or 0) * 100)
-                    pd_ = round((r.get("prob_draw") or 0) * 100)
-                    pa = round((r.get("prob_away") or 0) * 100)
                     conf = round((r.get("confidence") or 0) * 100)
                     o15 = round((r.get("over_15_prob") or 0) * 100)
                     o25 = round((r.get("over_25_prob") or 0) * 100)
                     xgh = r.get("expected_goals_home") or 0
                     xga = r.get("expected_goals_away") or 0
                     tier = "Elite" if conf >= 70 else "Alta" if conf >= 60 else "Média" if conf >= 50 else "Baixa"
+                    pred = r.get("predicted_result", "")
+
+                    # EV do resultado previsto
+                    ev_str = ""
+                    key = (_norm(r.get("home_team", "")), _norm(r.get("away_team", "")))
+                    mkt = odds_map.get(key)
+                    if mkt:
+                        prob = r.get({"H": "prob_home", "D": "prob_draw", "A": "prob_away"}.get(pred, "prob_home")) or 0
+                        odd = mkt.get({"H": "odd_home", "D": "odd_draw", "A": "odd_away"}.get(pred, "odd_home"))
+                        if odd and prob:
+                            ev = round((prob * odd - 1) * 100, 1)
+                            ev_str = f" | EV:{'+' if ev>0 else ''}{ev}%"
+                        odd_o25 = mkt.get("odd_over25_market")
+                        if odd_o25:
+                            prob_o25 = r.get("over_25_prob") or 0
+                            ev_o25 = round((prob_o25 * odd_o25 - 1) * 100, 1)
+                            ev_str += f" | O2.5 odd:{odd_o25:.2f} EV:{'+' if ev_o25>0 else ''}{ev_o25}%"
+
                     lines.append(
                         f"Rd{r['matchday']} {r['match_date'][:10]} | {r['home_team']} vs {r['away_team']} | "
-                        f"H:{ph}% D:{pd_}% A:{pa}% | prev:{r['predicted_result']} conf:{conf}% ({tier}) | "
-                        f"xG:{xgh:.1f}-{xga:.1f} | O1.5:{o15}% O2.5:{o25}%"
+                        f"prev:{pred} conf:{conf}% ({tier}) | "
+                        f"xG:{xgh:.1f}-{xga:.1f} | O1.5:{o15}% O2.5:{o25}%{ev_str}"
                     )
                 parts.append("\n".join(lines))
         except Exception as e:
