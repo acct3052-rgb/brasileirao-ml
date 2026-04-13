@@ -1644,7 +1644,7 @@ IS_PICKS_QUESTION = [
 
 def _build_picks(sb: Client) -> list[dict]:
     """
-    Monta as 6 melhores apostas rankeadas por score.
+    Monta as 6 melhores apostas da rodada atual, ordenadas por probabilidade decrescente.
     Ignora Over 0.5 (sempre alto). Inclui resultado H/D/A e Over 1.5/2.5/BTTS.
     """
     import unicodedata
@@ -1654,14 +1654,20 @@ def _build_picks(sb: Client) -> list[dict]:
         s = ''.join(c for c in s if unicodedata.category(c) != 'Mn')
         return s.replace(' ', '')
 
-    # Busca fixtures
-    fixtures = (
+    # Busca todos os fixtures futuros
+    all_fixtures = (
         sb.table("upcoming_predictions")
         .select("match_id,match_date,matchday,home_team,away_team,prob_home,prob_draw,prob_away,predicted_result,confidence,expected_goals_home,expected_goals_away,over_15_prob,over_25_prob,btts_prob")
         .order("match_date")
-        .limit(30)
+        .limit(50)
         .execute()
     ).data or []
+
+    # Filtra só a rodada mais próxima (menor matchday disponível)
+    if not all_fixtures:
+        return []
+    next_matchday = min(f.get("matchday") or 99 for f in all_fixtures)
+    fixtures = [f for f in all_fixtures if f.get("matchday") == next_matchday]
 
     # Busca odds de mercado
     odds_rows = (
@@ -1759,10 +1765,9 @@ def _build_picks(sb: Client) -> list[dict]:
                 "score": btts * 0.7 + conf * 0.3,
             })
 
-    # Ordena por score e pega as 6 melhores
-    candidates.sort(key=lambda x: x["score"], reverse=True)
+    # Ordena por probabilidade decrescente (mais provável primeiro)
+    candidates.sort(key=lambda x: x["prob"], reverse=True)
     top6 = candidates[:6]
-    # Remove campo interno de score
     for c in top6:
         c.pop("score", None)
     return top6
