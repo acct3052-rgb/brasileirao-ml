@@ -338,6 +338,40 @@ def get_accuracy_by_round(season: int | None = None, sb: Client = Depends(get_su
     return {"rounds": resp.data, "count": len(resp.data)}
 
 
+@app.get("/api/accuracy/by-round/{season}/{matchday}")
+def get_round_detail(season: int, matchday: int, sb: Client = Depends(get_supabase)):
+    """Detalhe jogo a jogo de uma rodada — acertos e erros."""
+    resp = (
+        sb.table("predictions")
+        .select("predicted_result, confidence, correct, matches!inner(match_date, home_team:home_team_id(name), away_team:away_team_id(name), home_goals, away_goals, matchday, season)")
+        .eq("matches.season", season)
+        .eq("matches.matchday", matchday)
+        .not_.is_("correct", "null")
+        .order("matches.match_date")
+        .execute()
+    )
+    games = []
+    for r in resp.data:
+        m = r.get("matches", {})
+        hg = m.get("home_goals")
+        ag = m.get("away_goals")
+        actual = None
+        if hg is not None and ag is not None:
+            actual = "H" if hg > ag else ("A" if ag > hg else "D")
+        games.append({
+            "home_team": m.get("home_team", {}).get("name", "?"),
+            "away_team": m.get("away_team", {}).get("name", "?"),
+            "match_date": m.get("match_date"),
+            "predicted_result": r.get("predicted_result"),
+            "actual_result": actual,
+            "home_goals": hg,
+            "away_goals": ag,
+            "confidence": r.get("confidence"),
+            "correct": r.get("correct"),
+        })
+    return {"season": season, "matchday": matchday, "games": games}
+
+
 @app.get("/api/accuracy/calibration")
 def get_calibration(sb: Client = Depends(get_supabase)):
     """
