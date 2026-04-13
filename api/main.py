@@ -392,8 +392,11 @@ def get_goals_lines(match_id: int, sb: Client = Depends(get_supabase)):
             "prob":       round(prob, 3),
             "prob_pct":   round(prob * 100),
             "fair_odd":   fair_odd,
+            "_sort":      prob,
             "highlight":  highlight,
         })
+
+    lines.sort(key=lambda x: x.pop("_sort"), reverse=True)
 
     return {
         "match_id":             match_id,
