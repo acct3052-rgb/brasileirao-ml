@@ -341,26 +341,40 @@ def get_accuracy_by_round(season: int | None = None, sb: Client = Depends(get_su
 @app.get("/api/accuracy/by-round/{season}/{matchday}")
 def get_round_detail(season: int, matchday: int, sb: Client = Depends(get_supabase)):
     """Detalhe jogo a jogo de uma rodada — acertos e erros."""
-    resp = (
-        sb.table("predictions")
-        .select("predicted_result, confidence, correct, matches!inner(match_date, home_team:home_team_id(name), away_team:away_team_id(name), home_goals, away_goals, matchday, season)")
-        .eq("matches.season", season)
-        .eq("matches.matchday", matchday)
-        .not_.is_("correct", "null")
-        .order("matches.match_date")
+    # 1. Busca match_ids da rodada
+    matches_resp = (
+        sb.table("matches")
+        .select("id, match_date, home_goals, away_goals, home_team:home_team_id(name), away_team:away_team_id(name)")
+        .eq("season", season)
+        .eq("matchday", matchday)
         .execute()
     )
+    match_ids = [m["id"] for m in (matches_resp.data or [])]
+    if not match_ids:
+        return {"season": season, "matchday": matchday, "games": []}
+
+    match_map = {m["id"]: m for m in matches_resp.data}
+
+    # 2. Busca predições para esses match_ids
+    preds_resp = (
+        sb.table("predictions")
+        .select("match_id, predicted_result, confidence, correct")
+        .in_("match_id", match_ids)
+        .not_.is_("correct", "null")
+        .execute()
+    )
+
     games = []
-    for r in resp.data:
-        m = r.get("matches", {})
+    for r in (preds_resp.data or []):
+        m = match_map.get(r["match_id"], {})
         hg = m.get("home_goals")
         ag = m.get("away_goals")
         actual = None
         if hg is not None and ag is not None:
             actual = "H" if hg > ag else ("A" if ag > hg else "D")
         games.append({
-            "home_team": m.get("home_team", {}).get("name", "?"),
-            "away_team": m.get("away_team", {}).get("name", "?"),
+            "home_team": (m.get("home_team") or {}).get("name", "?"),
+            "away_team": (m.get("away_team") or {}).get("name", "?"),
             "match_date": m.get("match_date"),
             "predicted_result": r.get("predicted_result"),
             "actual_result": actual,
@@ -369,6 +383,7 @@ def get_round_detail(season: int, matchday: int, sb: Client = Depends(get_supaba
             "confidence": r.get("confidence"),
             "correct": r.get("correct"),
         })
+    games.sort(key=lambda g: g["match_date"] or "")
     return {"season": season, "matchday": matchday, "games": games}
 
 
