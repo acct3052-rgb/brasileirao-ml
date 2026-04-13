@@ -1636,6 +1636,137 @@ Regras:
 - Se não tiver dados suficientes, dizer claramente
 - Não repetir o contexto inteiro, só o que responde a pergunta"""
 
+IS_PICKS_QUESTION = [
+    "6 melhores", "melhores apostas", "apostas elite", "ev positivo",
+    "monte", "cards", "picks", "selecione", "quais são as apostas",
+    "melhores oportunidades", "apostas da rodada"
+]
+
+def _build_picks(sb: Client) -> list[dict]:
+    """
+    Monta as 6 melhores apostas rankeadas por score.
+    Ignora Over 0.5 (sempre alto). Inclui resultado H/D/A e Over 1.5/2.5/BTTS.
+    """
+    import unicodedata
+
+    def _norm(s: str) -> str:
+        s = unicodedata.normalize('NFD', s.lower())
+        s = ''.join(c for c in s if unicodedata.category(c) != 'Mn')
+        return s.replace(' ', '')
+
+    # Busca fixtures
+    fixtures = (
+        sb.table("upcoming_predictions")
+        .select("match_id,match_date,matchday,home_team,away_team,prob_home,prob_draw,prob_away,predicted_result,confidence,expected_goals_home,expected_goals_away,over_15_prob,over_25_prob,btts_prob")
+        .order("match_date")
+        .limit(30)
+        .execute()
+    ).data or []
+
+    # Busca odds de mercado
+    odds_rows = (
+        sb.table("market_odds")
+        .select("home_team,away_team,odd_home,odd_draw,odd_away,odd_over25_market,best_over25_bk")
+        .execute()
+    ).data or []
+
+    odds_map: dict = {}
+    for o in odds_rows:
+        key = (_norm(o.get("home_team", "")), _norm(o.get("away_team", "")))
+        odds_map[key] = o
+
+    candidates: list[dict] = []
+
+    for f in fixtures:
+        conf = f.get("confidence") or 0
+        tier = "Elite" if conf >= 0.70 else "Alta" if conf >= 0.60 else "Média" if conf >= 0.50 else "Baixa"
+        key = (_norm(f.get("home_team", "")), _norm(f.get("away_team", "")))
+        mkt = odds_map.get(key)
+
+        pred = f.get("predicted_result", "H")
+        prob_map = {"H": f.get("prob_home") or 0, "D": f.get("prob_draw") or 0, "A": f.get("prob_away") or 0}
+        odd_map_keys = {"H": "odd_home", "D": "odd_draw", "A": "odd_away"}
+
+        # 1. Resultado previsto
+        prob_result = prob_map[pred]
+        odd_result = mkt.get(odd_map_keys[pred]) if mkt else None
+        ev_result = round((prob_result * odd_result - 1) * 100, 1) if odd_result else None
+        fair_result = round(1 / prob_result, 2) if prob_result > 0 else None
+
+        candidates.append({
+            "match": f"{f['home_team']} vs {f['away_team']}",
+            "matchday": f.get("matchday"),
+            "match_date": (f.get("match_date") or "")[:10],
+            "market": f"Resultado: {'Casa' if pred=='H' else 'Empate' if pred=='D' else 'Visitante'}",
+            "prob": round(prob_result * 100),
+            "tier": tier,
+            "fair_odd": fair_result,
+            "market_odd": odd_result,
+            "ev": ev_result,
+            "score": conf * 0.7 + prob_result * 0.3 + (0.2 if ev_result and ev_result > 0 else 0),
+        })
+
+        # 2. Over 1.5 (sem odd de mercado — mostra odd justa)
+        o15 = f.get("over_15_prob") or 0
+        if o15 >= 0.65:
+            fair_o15 = round(1 / o15, 2) if o15 > 0 else None
+            candidates.append({
+                "match": f"{f['home_team']} vs {f['away_team']}",
+                "matchday": f.get("matchday"),
+                "match_date": (f.get("match_date") or "")[:10],
+                "market": "Over 1.5 gols",
+                "prob": round(o15 * 100),
+                "tier": tier,
+                "fair_odd": fair_o15,
+                "market_odd": None,  # sem odd de mercado disponível
+                "ev": None,
+                "score": o15 * 0.8 + conf * 0.2,
+            })
+
+        # 3. Over 2.5 com odd de mercado
+        o25 = f.get("over_25_prob") or 0
+        odd_o25 = mkt.get("odd_over25_market") if mkt else None
+        if o25 >= 0.45 and odd_o25:
+            ev_o25 = round((o25 * odd_o25 - 1) * 100, 1)
+            fair_o25 = round(1 / o25, 2) if o25 > 0 else None
+            candidates.append({
+                "match": f"{f['home_team']} vs {f['away_team']}",
+                "matchday": f.get("matchday"),
+                "match_date": (f.get("match_date") or "")[:10],
+                "market": "Over 2.5 gols",
+                "prob": round(o25 * 100),
+                "tier": tier,
+                "fair_odd": fair_o25,
+                "market_odd": odd_o25,
+                "ev": ev_o25,
+                "score": o25 * 0.5 + (0.3 if ev_o25 > 0 else 0) + conf * 0.2,
+            })
+
+        # 4. BTTS
+        btts = f.get("btts_prob") or 0
+        if btts >= 0.55:
+            fair_btts = round(1 / btts, 2) if btts > 0 else None
+            candidates.append({
+                "match": f"{f['home_team']} vs {f['away_team']}",
+                "matchday": f.get("matchday"),
+                "match_date": (f.get("match_date") or "")[:10],
+                "market": "Ambos marcam",
+                "prob": round(btts * 100),
+                "tier": tier,
+                "fair_odd": fair_btts,
+                "market_odd": None,
+                "ev": None,
+                "score": btts * 0.7 + conf * 0.3,
+            })
+
+    # Ordena por score e pega as 6 melhores
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    top6 = candidates[:6]
+    # Remove campo interno de score
+    for c in top6:
+        c.pop("score", None)
+    return top6
+
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest, sb: Client = Depends(get_supabase)):
@@ -1646,12 +1777,28 @@ async def chat(req: ChatRequest, sb: Client = Depends(get_supabase)):
     if not api_key:
         raise HTTPException(503, "ANTHROPIC_API_KEY não configurada")
 
-    context = _build_chat_context(req.message, sb)
+    # Detecta se é pergunta de picks
+    is_picks = any(w in req.message.lower() for w in IS_PICKS_QUESTION)
+    picks: list[dict] = []
+
+    if is_picks:
+        picks = _build_picks(sb)
+        picks_text = "TOP 6 APOSTAS SELECIONADAS:\n"
+        for i, p in enumerate(picks, 1):
+            ev_str = f" EV:{'+' if (p['ev'] or 0)>0 else ''}{p['ev']}%" if p['ev'] is not None else " (sem odd de mercado — use odd justa)"
+            picks_text += (
+                f"{i}. {p['match']} | Rd{p['matchday']} {p['match_date']}\n"
+                f"   Mercado: {p['market']} | Prob: {p['prob']}% | Tier: {p['tier']}\n"
+                f"   Odd justa: {p['fair_odd']} | Odd mercado: {p['market_odd'] or 'N/D'}{ev_str}\n"
+            )
+        context = _build_chat_context(req.message, sb) + "\n\n" + picks_text
+    else:
+        context = _build_chat_context(req.message, sb)
 
     client = anthropic.Anthropic(api_key=api_key)
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=300,
+        max_tokens=400,
         system=SYSTEM_PROMPT,
         messages=[
             {
@@ -1661,7 +1808,7 @@ async def chat(req: ChatRequest, sb: Client = Depends(get_supabase)):
         ]
     )
 
-    return {"reply": response.content[0].text}
+    return {"reply": response.content[0].text, "picks": picks if is_picks else []}
 
 
 # ── Entrypoint ─────────────────────────────────────────────────────────────────
