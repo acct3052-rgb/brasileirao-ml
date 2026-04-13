@@ -295,8 +295,12 @@ def predict_from_features(features: dict) -> dict:
         "expected_goals_home":    round(lambda_home, 2),
         "expected_goals_away":    round(lambda_away, 2),
         "expected_total_goals":   round(lambda_home + lambda_away, 2),
+        "over_05_prob":           round(over_n_prob(lambda_home, lambda_away, 0.5), 3),
         "over_15_prob":           round(over_n_prob(lambda_home, lambda_away, 1.5), 3),
         "over_25_prob":           round(over25_prob(lambda_home, lambda_away), 3),
+        "over_35_prob":           round(over_n_prob(lambda_home, lambda_away, 3.5), 3),
+        "over_45_prob":           round(over_n_prob(lambda_home, lambda_away, 4.5), 3),
+        "btts_prob":              round(btts_prob(lambda_home, lambda_away), 3),
     }
 
 
@@ -336,6 +340,67 @@ def get_accuracy_by_round(season: int | None = None, sb: Client = Depends(get_su
         query = query.eq("season", season)
     resp = query.order("season", desc=True).order("matchday", desc=True).execute()
     return {"rounds": resp.data, "count": len(resp.data)}
+
+
+@app.get("/api/goals-lines/{match_id}")
+def get_goals_lines(match_id: int, sb: Client = Depends(get_supabase)):
+    """
+    Retorna todas as linhas de gols (Over 0.5 → 4.5) com probabilidade,
+    odd justa e nível de destaque para um jogo específico.
+    """
+    resp = (
+        sb.table("upcoming_predictions")
+        .select("expected_goals_home,expected_goals_away,over_05_prob,over_15_prob,over_25_prob,over_35_prob,over_45_prob,btts_prob")
+        .eq("match_id", match_id)
+        .limit(1)
+        .execute()
+    )
+    if not resp.data:
+        raise HTTPException(404, "Predição não encontrada")
+
+    r = resp.data[0]
+    lh = r.get("expected_goals_home") or 0
+    la = r.get("expected_goals_away") or 0
+
+    # Se colunas ainda não existem na view, recalcula ao vivo
+    def get_prob(key: str, n: float) -> float:
+        v = r.get(key)
+        if v is not None:
+            return float(v)
+        return round(over_n_prob(lh, la, n), 3)
+
+    lines = []
+    configs = [
+        ("Over 0.5", get_prob("over_05_prob", 0.5), 0.95, 0.90),
+        ("Over 1.5", get_prob("over_15_prob", 1.5), 0.80, 0.72),
+        ("Over 2.5", get_prob("over_25_prob", 2.5), 0.60, 0.52),
+        ("Over 3.5", get_prob("over_35_prob", 3.5), 0.40, 0.30),
+        ("Over 4.5", get_prob("over_45_prob", 4.5), 0.25, 0.18),
+        ("BTTS",     get_prob("btts_prob",    -1),   0.65, 0.55),
+    ]
+    for label, prob, hot_threshold, good_threshold in configs:
+        if label == "BTTS" and r.get("btts_prob") is None:
+            prob = round(btts_prob(lh, la), 3)
+        fair_odd = round(1 / prob, 2) if prob > 0 else None
+        highlight = (
+            "hot"    if prob >= hot_threshold  else
+            "good"   if prob >= good_threshold else
+            "normal"
+        )
+        lines.append({
+            "label":      label,
+            "prob":       round(prob, 3),
+            "prob_pct":   round(prob * 100),
+            "fair_odd":   fair_odd,
+            "highlight":  highlight,
+        })
+
+    return {
+        "match_id":             match_id,
+        "expected_goals_home":  lh,
+        "expected_goals_away":  la,
+        "lines":                lines,
+    }
 
 
 @app.get("/api/accuracy/by-round/{season}/{matchday}")
