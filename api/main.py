@@ -1493,12 +1493,38 @@ def _build_chat_context(message: str, sb: Client) -> str:
                 .execute()
             ).data or []
 
-            # Busca odds de mercado
-            odds_rows = (
-                sb.table("market_odds")
-                .select("home_team,away_team,odd_home,odd_draw,odd_away,odd_over25_market")
-                .execute()
-            ).data or []
+            # Busca odds de mercado da The Odds API
+            odds_rows = []
+            try:
+                import requests as req
+                odds_key = os.environ.get("ODDS_API_KEY", "")
+                if odds_key:
+                    r = req.get(
+                        "https://api.the-odds-api.com/v4/sports/soccer_brazil_campeonato/odds",
+                        params={"apiKey": odds_key, "regions": "eu", "markets": "h2h,totals", "oddsFormat": "decimal"},
+                        timeout=10
+                    )
+                    if r.ok:
+                        for game in r.json():
+                            best_h = best_d = best_a = best_o25 = None
+                            for bk in game.get("bookmakers", []):
+                                for mkt in bk.get("markets", []):
+                                    if mkt["key"] == "h2h":
+                                        for o in mkt["outcomes"]:
+                                            if o["name"] == game.get("home_team"): best_h = max(best_h or 0, o["price"])
+                                            elif o["name"] == game.get("away_team"): best_a = max(best_a or 0, o["price"])
+                                            else: best_d = max(best_d or 0, o["price"])
+                                    elif mkt["key"] == "totals":
+                                        for o in mkt["outcomes"]:
+                                            if o["name"] == "Over": best_o25 = max(best_o25 or 0, o["price"])
+                            odds_rows.append({
+                                "home_team": game.get("home_team", ""),
+                                "away_team": game.get("away_team", ""),
+                                "odd_home": best_h, "odd_draw": best_d,
+                                "odd_away": best_a, "odd_over25_market": best_o25,
+                            })
+            except Exception as e:
+                log.warning(f"chat context odds fetch: {e}")
 
             # Monta lookup de odds por times normalizados
             def _norm(s: str) -> str:
@@ -1669,17 +1695,38 @@ def _build_picks(sb: Client) -> list[dict]:
     next_matchday = min(f.get("matchday") or 99 for f in all_fixtures)
     fixtures = [f for f in all_fixtures if f.get("matchday") == next_matchday]
 
-    # Busca odds de mercado
-    odds_rows = (
-        sb.table("market_odds")
-        .select("home_team,away_team,odd_home,odd_draw,odd_away,odd_over25_market,best_over25_bk")
-        .execute()
-    ).data or []
-
+    # Busca odds de mercado da The Odds API
     odds_map: dict = {}
-    for o in odds_rows:
-        key = (_norm(o.get("home_team", "")), _norm(o.get("away_team", "")))
-        odds_map[key] = o
+    try:
+        import requests as req
+        odds_key = os.environ.get("ODDS_API_KEY", "")
+        if odds_key:
+            r = req.get(
+                "https://api.the-odds-api.com/v4/sports/soccer_brazil_campeonato/odds",
+                params={"apiKey": odds_key, "regions": "eu", "markets": "h2h,totals", "oddsFormat": "decimal"},
+                timeout=10
+            )
+            if r.ok:
+                for game in r.json():
+                    best_h = best_d = best_a = best_o25 = None
+                    for bk in game.get("bookmakers", []):
+                        for mkt in bk.get("markets", []):
+                            if mkt["key"] == "h2h":
+                                for o in mkt["outcomes"]:
+                                    if o["name"] == game.get("home_team"): best_h = max(best_h or 0, o["price"])
+                                    elif o["name"] == game.get("away_team"): best_a = max(best_a or 0, o["price"])
+                                    else: best_d = max(best_d or 0, o["price"])
+                            elif mkt["key"] == "totals":
+                                for o in mkt["outcomes"]:
+                                    if o["name"] == "Over": best_o25 = max(best_o25 or 0, o["price"])
+                    ht = game.get("home_team", "")
+                    at = game.get("away_team", "")
+                    odds_map[(_norm(ht), _norm(at))] = {
+                        "odd_home": best_h, "odd_draw": best_d,
+                        "odd_away": best_a, "odd_over25_market": best_o25,
+                    }
+    except Exception as e:
+        log.warning(f"_build_picks odds fetch: {e}")
 
     candidates: list[dict] = []
 
