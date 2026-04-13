@@ -1441,22 +1441,53 @@ def _build_chat_context(message: str, sb: Client) -> str:
         except Exception as e:
             log.warning(f"chat context accuracy: {e}")
 
-    # Acurácia por rodada (últimas 5)
-    if any(w in msg for w in ["rodada", "round", "última", "recente"]):
+    # Acurácia por rodada — detecta número específico ou carrega todas
+    if any(w in msg for w in ["rodada", "round", "última", "recente", "acerto", "errou", "acertou"]):
+        import re
+        round_numbers = [int(n) for n in re.findall(r'\b(\d{1,2})\b', msg)]
         try:
-            rows = (
+            # Todas as rodadas com resultado
+            all_rounds = (
                 sb.table("round_accuracy")
-                .select("season,matchday,total,correct,accuracy")
+                .select("season,matchday,total,correct,wrong,accuracy_pct,avg_confidence")
                 .order("season", desc=True)
                 .order("matchday", desc=True)
-                .limit(5)
                 .execute()
             ).data or []
-            if rows:
-                lines = ["ACURÁCIA POR RODADA (últimas 5):"]
-                for r in rows:
-                    lines.append(f"  {r['season']} Rd{r['matchday']}: {r['correct']}/{r['total']} = {round((r['accuracy'] or 0)*100)}%")
+            if all_rounds:
+                lines = ["ACURÁCIA POR RODADA:"]
+                for r in all_rounds:
+                    acc = round((r.get("accuracy_pct") or 0))
+                    conf = round((r.get("avg_confidence") or 0) * 100)
+                    lines.append(f"  {r['season']} Rd{r['matchday']}: {r['correct']}/{r['total']} acertos = {acc}% (conf média {conf}%)")
                 parts.append("\n".join(lines))
+
+            # Se perguntou sobre rodada específica, busca jogo a jogo
+            if round_numbers:
+                season_now = datetime.now(timezone.utc).year
+                for rd in round_numbers[:2]:  # máx 2 rodadas para não explodir contexto
+                    games = (
+                        sb.table("predictions")
+                        .select("predicted_result,correct,confidence,matches!inner(home_team:home_team_id(name),away_team:away_team_id(name),home_goals,away_goals,matchday,season)")
+                        .eq("matches.season", season_now)
+                        .eq("matches.matchday", rd)
+                        .not_.is_("correct", "null")
+                        .execute()
+                    ).data or []
+                    if games:
+                        lines = [f"DETALHES Rd{rd} ({season_now}):"]
+                        for g in games:
+                            m = g.get("matches", {})
+                            ht = m.get("home_team", {}).get("name", "?")
+                            at = m.get("away_team", {}).get("name", "?")
+                            hg = m.get("home_goals")
+                            ag = m.get("away_goals")
+                            score = f"{hg}-{ag}" if hg is not None else "?"
+                            pred = g.get("predicted_result", "?")
+                            ok = "✓" if g.get("correct") else "✗"
+                            conf = round((g.get("confidence") or 0) * 100)
+                            lines.append(f"  {ok} {ht} vs {at} [{score}] prev:{pred} conf:{conf}%")
+                        parts.append("\n".join(lines))
         except Exception as e:
             log.warning(f"chat context round_accuracy: {e}")
 
