@@ -763,8 +763,7 @@ def create_bet(req: BetCreate, sb: Client = Depends(get_supabase)):
         model_prob = prob_map.get(req.bet_outcome)
         model_pick = pred.get("predicted_result")
 
-    data = {
-        "match_id": req.match_id,
+    data: dict = {
         "bet_outcome": req.bet_outcome,
         "odd": req.odd,
         "stake": req.stake,
@@ -775,6 +774,8 @@ def create_bet(req: BetCreate, sb: Client = Depends(get_supabase)):
         "is_combo": req.is_combo,
         "combo_description": req.combo_description,
     }
+    if req.match_id is not None:
+        data["match_id"] = req.match_id
     resp = sb.table("user_bets").insert(data).execute()
     return resp.data[0]
 
