@@ -325,6 +325,73 @@ def get_fixtures(limit: int = 50, sb: Client = Depends(get_supabase)):
     return {"fixtures": resp.data, "count": len(resp.data)}
 
 
+@app.get("/api/fixtures/current-round")
+def get_current_round_fixtures(sb: Client = Depends(get_supabase)):
+    """
+    Retorna todos os jogos da rodada atual (passados e futuros).
+    Usado no formulário de registro de apostas.
+    """
+    season = datetime.now(timezone.utc).year
+
+    # Descobre a rodada atual — menor matchday com jogos futuros ou o maior matchday já jogado
+    upcoming = sb.table("upcoming_predictions").select("matchday").order("match_date").limit(1).execute()
+    if upcoming.data:
+        current_matchday = upcoming.data[0]["matchday"]
+    else:
+        # Fallback: maior rodada da temporada
+        last = (
+            sb.table("matches")
+            .select("matchday")
+            .eq("season", season)
+            .order("matchday", desc=True)
+            .limit(1)
+            .execute()
+        )
+        current_matchday = last.data[0]["matchday"] if last.data else 1
+
+    # Busca predições da rodada atual (com ou sem resultado)
+    match_ids_resp = (
+        sb.table("matches")
+        .select("id")
+        .eq("season", season)
+        .eq("matchday", current_matchday)
+        .execute()
+    )
+    match_ids = [m["id"] for m in (match_ids_resp.data or [])]
+    if not match_ids:
+        return {"fixtures": [], "matchday": current_matchday}
+
+    preds_resp = (
+        sb.table("predictions")
+        .select("match_id,prob_home,prob_draw,prob_away,predicted_result,confidence,expected_goals_home,expected_goals_away,over_15_prob,over_25_prob,matches!inner(match_date,matchday,season,home_team:home_team_id(name),away_team:away_team_id(name))")
+        .in_("match_id", match_ids)
+        .execute()
+    )
+
+    fixtures = []
+    for r in (preds_resp.data or []):
+        m = r.get("matches", {})
+        fixtures.append({
+            "match_id": r["match_id"],
+            "match_date": m.get("match_date"),
+            "matchday": m.get("matchday"),
+            "season": m.get("season"),
+            "home_team": (m.get("home_team") or {}).get("name", "?"),
+            "away_team": (m.get("away_team") or {}).get("name", "?"),
+            "prob_home": r.get("prob_home"),
+            "prob_draw": r.get("prob_draw"),
+            "prob_away": r.get("prob_away"),
+            "predicted_result": r.get("predicted_result"),
+            "confidence": r.get("confidence"),
+            "expected_goals_home": r.get("expected_goals_home"),
+            "expected_goals_away": r.get("expected_goals_away"),
+            "over_15_prob": r.get("over_15_prob"),
+            "over_25_prob": r.get("over_25_prob"),
+        })
+    fixtures.sort(key=lambda x: x["match_date"] or "")
+    return {"fixtures": fixtures, "matchday": current_matchday, "count": len(fixtures)}
+
+
 @app.get("/api/accuracy")
 def get_accuracy(sb: Client = Depends(get_supabase)):
     """Acurácia histórica do modelo."""
