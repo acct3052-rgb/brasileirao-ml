@@ -90,9 +90,26 @@ AWAY_SPLIT_COLS = [
 # Pesos do blend: [resultado_geral, home_split, away_split]
 _BLEND_WEIGHTS = [0.5, 0.25, 0.25]
 
-# ── Estado global dos modelos ─────────────────────────────────────────────────
+# ── Ligas suportadas ──────────────────────────────────────────────────────────
 
-models = {}
+LEAGUES_META: dict[str, dict] = {
+    "BSA": {"name": "Brasileirão Série A", "flag": "🇧🇷", "active": True},
+    "BSB": {"name": "Brasileirão Série B", "flag": "🇧🇷", "active": False},
+    "PL":  {"name": "Premier League",      "flag": "🏴󠁧󠁢󠁥󠁮󠁧󠁿", "active": True},
+    "PD":  {"name": "La Liga",             "flag": "🇪🇸", "active": False},
+    "SA":  {"name": "Serie A",             "flag": "🇮🇹", "active": False},
+    "FL1": {"name": "Ligue 1",             "flag": "🇫🇷", "active": False},
+    "BL1": {"name": "Bundesliga",          "flag": "🇩🇪", "active": False},
+    "CL":  {"name": "Champions League",    "flag": "🏆",  "active": False},
+    "DED": {"name": "Eredivisie",          "flag": "🇳🇱", "active": False},
+    "PPL": {"name": "Primeira Liga",       "flag": "🇵🇹", "active": False},
+    "ELC": {"name": "Championship",        "flag": "🏴󠁧󠁢󠁥󠁮󠁧󠁿", "active": False},
+}
+
+# ── Estado global dos modelos (por liga) ──────────────────────────────────────
+
+# models_by_league["BSA"] = {"result_model": ..., "label_encoder": ..., ...}
+models_by_league: dict[str, dict] = {}
 
 # ── Estado do retreinamento ───────────────────────────────────────────────────
 
@@ -105,23 +122,52 @@ _retrain_state: dict = {
 }
 
 
-def load_models():
-    for name in ["result_model", "label_encoder", "home_goals_model", "away_goals_model",
-                 "home_split_model", "away_split_model"]:
-        path = f"{MODELS_DIR}/{name}_latest.pkl"
+def load_models_for_league(league: str) -> dict:
+    """Carrega os modelos de uma liga específica. Retorna dict com os modelos."""
+    league_models: dict = {}
+    model_names = ["result_model", "label_encoder", "home_goals_model", "away_goals_model",
+                   "home_split_model", "away_split_model"]
+
+    # Tenta pasta models/{league}/ primeiro
+    league_dir = os.path.join(MODELS_DIR, league)
+    # Fallback: raiz de models/ (legado BSA)
+    fallback_dir = MODELS_DIR
+
+    for name in model_names:
+        path = os.path.join(league_dir, f"{name}_latest.pkl")
+        if not os.path.exists(path):
+            path = os.path.join(fallback_dir, f"{name}_latest.pkl")
         if os.path.exists(path):
             with open(path, "rb") as f:
-                models[name] = pickle.load(f)
-            log.info(f"Modelo carregado: {name}")
+                league_models[name] = pickle.load(f)
+            log.info(f"[{league}] Modelo carregado: {name}")
         else:
-            models[name] = None
+            league_models[name] = None
             if name not in ("home_split_model", "away_split_model"):
-                log.warning(f"Modelo não encontrado: {path}")
+                log.warning(f"[{league}] Modelo não encontrado: {path}")
+
+    return league_models
+
+
+def load_all_models():
+    """Carrega modelos de todas as ligas ativas na inicialização."""
+    for league, meta in LEAGUES_META.items():
+        if meta["active"]:
+            models_by_league[league] = load_models_for_league(league)
+            log.info(f"Liga {league} ({meta['name']}) — modelos carregados")
+
+
+def get_models(league: str = "BSA") -> dict:
+    """Retorna os modelos da liga. Carrega sob demanda se não estiver em cache."""
+    if league not in models_by_league:
+        log.info(f"Carregando modelos para {league} sob demanda...")
+        models_by_league[league] = load_models_for_league(league)
+    return models_by_league[league]
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    load_models()
+    load_all_models()
     yield
 
 
@@ -239,18 +285,19 @@ def result_probs_dc(lambda_home: float, lambda_away: float) -> tuple[float, floa
     return p_home, p_draw, p_away
 
 
-def predict_from_features(features: dict) -> dict:
-    if not models.get("result_model"):
-        raise HTTPException(status_code=503, detail="Modelo não carregado")
+def predict_from_features(features: dict, league: str = "BSA") -> dict:
+    m = get_models(league)
+    if not m.get("result_model"):
+        raise HTTPException(status_code=503, detail=f"Modelo não carregado para liga {league}")
 
     X_full = pd.DataFrame([features])[FEATURE_COLS].fillna(0)
-    classes = models["label_encoder"].classes_  # ['A', 'D', 'H']
+    classes = m["label_encoder"].classes_  # ['A', 'D', 'H']
 
     # Resultado — blend entre modelo geral + splits home/away (se disponíveis)
-    proba_general = models["result_model"].predict_proba(X_full)[0]
+    proba_general = m["result_model"].predict_proba(X_full)[0]
 
-    home_split = models.get("home_split_model")
-    away_split = models.get("away_split_model")
+    home_split = m.get("home_split_model")
+    away_split = m.get("away_split_model")
 
     if home_split is not None and away_split is not None:
         X_home = pd.DataFrame([features])[HOME_SPLIT_COLS].fillna(0)
@@ -263,8 +310,8 @@ def predict_from_features(features: dict) -> dict:
         proba = proba_general
 
     # Gols esperados (necessário antes do blend DC)
-    lambda_home = float(models["home_goals_model"].predict(X_full)[0])
-    lambda_away = float(models["away_goals_model"].predict(X_full)[0])
+    lambda_home = float(m["home_goals_model"].predict(X_full)[0])
+    lambda_away = float(m["away_goals_model"].predict(X_full)[0])
     lambda_home = max(0.1, lambda_home)
     lambda_away = max(0.1, lambda_away)
 
@@ -308,25 +355,48 @@ def predict_from_features(features: dict) -> dict:
 
 @app.get("/health")
 def health():
-    loaded = [k for k, v in models.items() if v is not None]
-    blend_active = models.get("home_split_model") is not None and models.get("away_split_model") is not None
+    summary = {}
+    for lg, m in models_by_league.items():
+        loaded = [k for k, v in m.items() if v is not None]
+        summary[lg] = loaded
     return {
         "status": "ok",
-        "models_loaded": loaded,
-        "blend_active": blend_active,
+        "models_by_league": summary,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
+@app.get("/api/leagues")
+def get_leagues():
+    """Lista todas as ligas com status de modelos disponíveis."""
+    result = []
+    for code, meta in LEAGUES_META.items():
+        has_model = code in models_by_league and models_by_league[code].get("result_model") is not None
+        result.append({
+            "code": code,
+            "name": meta["name"],
+            "flag": meta["flag"],
+            "active": meta["active"],
+            "has_model": has_model,
+        })
+    return {"leagues": result}
+
+
 @app.get("/api/fixtures")
-def get_fixtures(limit: int = 50, sb: Client = Depends(get_supabase)):
-    """Próximos jogos do Brasileirão com predições."""
-    resp = sb.table("upcoming_predictions").select("*").limit(limit).execute()
+def get_fixtures(limit: int = 50, league: str = "BSA", sb: Client = Depends(get_supabase)):
+    """Próximos jogos com predições, filtrado por liga."""
+    resp = (
+        sb.table("upcoming_predictions")
+        .select("*")
+        .eq("league", league)
+        .limit(limit)
+        .execute()
+    )
     return {"fixtures": resp.data, "count": len(resp.data)}
 
 
 @app.get("/api/fixtures/current-round")
-def get_current_round_fixtures(sb: Client = Depends(get_supabase)):
+def get_current_round_fixtures(league: str = "BSA", sb: Client = Depends(get_supabase)):
     """
     Retorna todos os jogos da rodada atual (passados e futuros).
     Usado no formulário de registro de apostas.
@@ -334,15 +404,22 @@ def get_current_round_fixtures(sb: Client = Depends(get_supabase)):
     season = datetime.now(timezone.utc).year
 
     # Descobre a rodada atual — menor matchday com jogos futuros ou o maior matchday já jogado
-    upcoming = sb.table("upcoming_predictions").select("matchday").order("match_date").limit(1).execute()
+    upcoming = (
+        sb.table("upcoming_predictions")
+        .select("matchday")
+        .eq("league", league)
+        .order("match_date")
+        .limit(1)
+        .execute()
+    )
     if upcoming.data:
         current_matchday = upcoming.data[0]["matchday"]
     else:
-        # Fallback: maior rodada da temporada
         last = (
             sb.table("matches")
             .select("matchday")
             .eq("season", season)
+            .eq("league", league)
             .order("matchday", desc=True)
             .limit(1)
             .execute()
@@ -354,6 +431,7 @@ def get_current_round_fixtures(sb: Client = Depends(get_supabase)):
         sb.table("matches")
         .select("id")
         .eq("season", season)
+        .eq("league", league)
         .eq("matchday", current_matchday)
         .execute()
     )
@@ -393,16 +471,16 @@ def get_current_round_fixtures(sb: Client = Depends(get_supabase)):
 
 
 @app.get("/api/accuracy")
-def get_accuracy(sb: Client = Depends(get_supabase)):
-    """Acurácia histórica do modelo."""
-    resp = sb.table("model_accuracy").select("*").execute()
+def get_accuracy(league: str = "BSA", sb: Client = Depends(get_supabase)):
+    """Acurácia histórica do modelo por liga."""
+    resp = sb.table("model_accuracy").select("*").eq("league", league).execute()
     return resp.data[0] if resp.data else {"total_predictions": 0, "accuracy_pct": None}
 
 
 @app.get("/api/accuracy/by-round")
-def get_accuracy_by_round(season: int | None = None, sb: Client = Depends(get_supabase)):
+def get_accuracy_by_round(league: str = "BSA", season: int | None = None, sb: Client = Depends(get_supabase)):
     """Acurácia do modelo por rodada."""
-    query = sb.table("round_accuracy").select("*")
+    query = sb.table("round_accuracy").select("*").eq("league", league)
     if season:
         query = query.eq("season", season)
     resp = query.order("season", desc=True).order("matchday", desc=True).execute()
@@ -544,11 +622,12 @@ def get_calibration(sb: Client = Depends(get_supabase)):
 
 
 @app.get("/api/predictions/recent")
-def get_recent_predictions(limit: int = 20, sb: Client = Depends(get_supabase)):
+def get_recent_predictions(limit: int = 20, league: str = "BSA", sb: Client = Depends(get_supabase)):
     """Últimas predições com resultado real (para validação)."""
     resp = (
         sb.table("predictions")
         .select("*, matches!inner(match_date, home_team:home_team_id(name), away_team:away_team_id(name), home_goals, away_goals)")
+        .eq("league", league)
         .not_.is_("actual_result", "null")
         .order("predicted_at", desc=True)
         .limit(limit)
@@ -586,9 +665,10 @@ def predict_match(req: PredictRequest, sb: Client = Depends(get_supabase)):
 
 
 @app.post("/api/predict/batch")
-def predict_batch(season: int | None = None, sb: Client = Depends(get_supabase)):
-    if not models.get("result_model"):
-        raise HTTPException(503, "Modelo não carregado")
+def predict_batch(season: int | None = None, league: str = "BSA", sb: Client = Depends(get_supabase)):
+    m = get_models(league)
+    if not m.get("result_model"):
+        raise HTTPException(503, f"Modelo não carregado para liga {league}")
 
     query = sb.table("match_features").select("*, matches!inner(status, season)")
     if season:
@@ -671,8 +751,8 @@ def update_results(sb: Client = Depends(get_supabase)):
 # ── Retreinamento com status ───────────────────────────────────────────────────
 
 @app.post("/api/retrain")
-def retrain(background_tasks: BackgroundTasks, _=Depends(verify_admin)):
-    """Retreina o modelo completo: build_features --all + train_model. Retorna imediatamente."""
+def retrain(background_tasks: BackgroundTasks, league: str = "BSA", _=Depends(verify_admin)):
+    """Retreina o modelo de uma liga: build_features + train_model. Retorna imediatamente."""
     with _retrain_lock:
         if _retrain_state["status"] == "running":
             raise HTTPException(409, "Treinamento já em andamento")
@@ -685,17 +765,17 @@ def retrain(background_tasks: BackgroundTasks, _=Depends(verify_admin)):
 
     def _run():
         try:
-            log.info("Retreinamento iniciado: build_features --all")
-            subprocess.run(["python", "scripts/build_features.py", "--all"], check=True)
-            log.info("Retreinamento: train_model")
-            subprocess.run(["python", "scripts/train_model.py"], check=True)
-            load_models()
+            log.info(f"Retreinamento [{league}]: build_features --all")
+            subprocess.run(["python", "scripts/build_features.py", "--all", f"--league={league}"], check=True)
+            log.info(f"Retreinamento [{league}]: train_model")
+            subprocess.run(["python", "scripts/train_model.py", f"--league={league}"], check=True)
+            models_by_league[league] = load_models_for_league(league)
             with _retrain_lock:
                 _retrain_state.update({
                     "status": "done",
                     "finished_at": datetime.now(timezone.utc).isoformat(),
                 })
-            log.info("Retreinamento concluído")
+            log.info(f"Retreinamento [{league}] concluído")
         except Exception as e:
             with _retrain_lock:
                 _retrain_state.update({"status": "error", "error": str(e)})

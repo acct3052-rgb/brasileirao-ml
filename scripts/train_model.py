@@ -100,16 +100,32 @@ AWAY_SPLIT_COLS = [
 
 # ── Carrega dados ──────────────────────────────────────────────────────────────
 
-def load_training_data() -> pd.DataFrame:
+def load_training_data(league: str = "BSA") -> pd.DataFrame:
     sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
-    # Join features + resultado real
-    resp = (
-        sb.table("match_features")
-        .select("*, matches!inner(result, home_goals, away_goals, season, match_date)")
-        .execute()
-    )
-    df = pd.DataFrame(resp.data)
+    # Carrega features filtradas pela liga + join com resultado real
+    all_data = []
+    page_size = 1000
+    offset = 0
+    while True:
+        resp = (
+            sb.table("match_features")
+            .select("*, matches!inner(result, home_goals, away_goals, season, match_date)")
+            .eq("league", league)
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+        if not resp.data:
+            break
+        all_data.extend(resp.data)
+        if len(resp.data) < page_size:
+            break
+        offset += page_size
+
+    df = pd.DataFrame(all_data)
+    if df.empty:
+        raise ValueError(f"Nenhuma feature encontrada para liga {league}. "
+                         f"Execute build_features.py --league {league} primeiro.")
 
     # Flatten JSON aninhado — remove season duplicada antes do join
     matches_df = pd.json_normalize(df["matches"]).drop(columns=["season"], errors="ignore")
@@ -118,7 +134,7 @@ def load_training_data() -> pd.DataFrame:
     # Remove jogos sem resultado
     df = df[df["result"].notna()].copy()
 
-    log.info(f"  {len(df)} partidas com features e resultado carregadas")
+    log.info(f"  {len(df)} partidas ({league}) com features e resultado carregadas")
     return df
 
 
@@ -338,13 +354,21 @@ def over25_prob_from_poisson(lambda_home: float, lambda_away: float) -> float:
 
 # ── Salva e carrega modelos ────────────────────────────────────────────────────
 
+def get_models_dir(league: str) -> str:
+    """Retorna o diretório de modelos para a liga. Cria se não existir."""
+    path = os.path.join(MODELS_DIR, league)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def save_models(result_model, label_encoder, home_goals_model, away_goals_model,
-                home_split_model=None, away_split_model=None):
+                home_split_model=None, away_split_model=None, league: str = "BSA"):
     version = datetime.now().strftime("%Y%m%d_%H%M")
+    models_dir = get_models_dir(league)
 
     objects = [
-        ("result_model",    result_model),
-        ("label_encoder",   label_encoder),
+        ("result_model",     result_model),
+        ("label_encoder",    label_encoder),
         ("home_goals_model", home_goals_model),
         ("away_goals_model", away_goals_model),
     ]
@@ -353,10 +377,9 @@ def save_models(result_model, label_encoder, home_goals_model, away_goals_model,
     if away_split_model is not None:
         objects.append(("away_split_model", away_split_model))
 
-    # Salva versão com timestamp
     for name, obj in objects:
-        path_versioned = f"{MODELS_DIR}/{name}_{version}.pkl"
-        path_latest    = f"{MODELS_DIR}/{name}_latest.pkl"
+        path_versioned = os.path.join(models_dir, f"{name}_{version}.pkl")
+        path_latest    = os.path.join(models_dir, f"{name}_latest.pkl")
 
         with open(path_versioned, "wb") as f:
             pickle.dump(obj, f)
@@ -365,21 +388,25 @@ def save_models(result_model, label_encoder, home_goals_model, away_goals_model,
 
         log.info(f"  Salvo: {path_latest}")
 
-    log.info(f"  Versão: {version}")
+    log.info(f"  Liga: {league} | Versão: {version}")
     return version
 
 
-def load_models() -> tuple:
-    """Carrega os modelos mais recentes. Usado pela API."""
+def load_models(league: str = "BSA") -> tuple:
+    """Carrega os modelos mais recentes da liga. Usado pela API."""
+    models_dir = get_models_dir(league)
     models = {}
     for name in ["result_model", "label_encoder", "home_goals_model", "away_goals_model",
                  "home_split_model", "away_split_model"]:
-        path = f"{MODELS_DIR}/{name}_latest.pkl"
+        path = os.path.join(models_dir, f"{name}_latest.pkl")
+        # fallback: modelos antigos na raiz (BSA legado)
+        if not os.path.exists(path) and league == "BSA":
+            path = os.path.join(MODELS_DIR, f"{name}_latest.pkl")
         if os.path.exists(path):
             with open(path, "rb") as f:
                 models[name] = pickle.load(f)
         else:
-            models[name] = None  # split models opcionais
+            models[name] = None
     return (
         models["result_model"],
         models["label_encoder"],
@@ -409,14 +436,17 @@ def log_feature_importance(model, label_encoder):
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Treina os modelos ML do Brasileirão")
+    parser = argparse.ArgumentParser(description="Treina os modelos ML por liga")
+    parser.add_argument("--league", type=str, default="BSA",
+                        help="Código da liga (ex: BSA, PL, PD)")
     parser.add_argument("--season-test", type=int, help="Temporada para usar como hold-out")
     parser.add_argument("--decay-lambda", type=float, default=0.003,
                         help="Lambda do decay exponencial (padrão: 0.003 ≈ meia-vida 230 dias)")
     args = parser.parse_args()
 
+    log.info(f"── Liga: {args.league} ──────────────────────────────────")
     log.info("── Carregando dados ──────────────────────")
-    df = load_training_data()
+    df = load_training_data(league=args.league)
 
     log.info(f"── Treinando modelo de resultado (XGBoost + decay λ={args.decay_lambda}) ──")
     result_model, label_encoder = train_result_model(df, test_season=args.season_test,
@@ -434,8 +464,8 @@ if __name__ == "__main__":
     log.info("── Salvando modelos ──────────────────────")
     version = save_models(
         result_model, label_encoder, home_goals_model, away_goals_model,
-        home_split_model, away_split_model
+        home_split_model, away_split_model, league=args.league
     )
 
-    log.info(f"\nTreinamento concluído. Versão: {version}")
+    log.info(f"\nTreinamento concluído. Liga: {args.league} | Versão: {version}")
     log.info("Execute 'python api/main.py' para servir as predições.")

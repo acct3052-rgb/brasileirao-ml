@@ -65,7 +65,7 @@ def load_historical_matches(sb: Client, seasons: list[int]) -> pd.DataFrame:
     return df
 
 
-def load_matches(sb: Client, seasons: list[int]) -> pd.DataFrame:
+def load_matches(sb: Client, seasons: list[int], league: str = "BSA") -> pd.DataFrame:
     all_data = []
     page_size = 1000
     offset = 0
@@ -74,6 +74,7 @@ def load_matches(sb: Client, seasons: list[int]) -> pd.DataFrame:
             sb.table("matches")
             .select("*")
             .in_("season", seasons)
+            .eq("league", league)
             .eq("status", "FINISHED")
             .order("match_date")
             .range(offset, offset + page_size - 1)
@@ -85,18 +86,19 @@ def load_matches(sb: Client, seasons: list[int]) -> pd.DataFrame:
         if len(resp.data) < page_size:
             break
         offset += page_size
-    log.info(f"  {len(all_data)} partidas (football-data) carregadas")
+    log.info(f"  {len(all_data)} partidas ({league}) carregadas")
     df = pd.DataFrame(all_data)
     df["match_date"] = pd.to_datetime(df["match_date"], utc=True)
     return df
 
 
-def load_scheduled(sb: Client, season: int) -> pd.DataFrame:
+def load_scheduled(sb: Client, season: int, league: str = "BSA") -> pd.DataFrame:
     """Carrega jogos ainda não disputados (para predição futura)."""
     resp = (
         sb.table("matches")
         .select("*")
         .eq("season", season)
+        .eq("league", league)
         .in_("status", ["SCHEDULED", "TIMED"])
         .order("match_date")
         .execute()
@@ -389,6 +391,7 @@ def build_features_for_matches(
 
         rows.append({
             "match_id":           match["id"],
+            "league":             match.get("league", "BSA"),
             # Form geral
             "home_form_pts":      hf["pts"],
             "away_form_pts":      af["pts"],
@@ -450,24 +453,26 @@ def save_features(sb: Client, rows: list[dict]) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Calcula features para o modelo ML")
+    parser.add_argument("--league", type=str, default="BSA", help="Código da liga (ex: BSA, PL)")
     parser.add_argument("--season", type=int, action="append", dest="seasons")
     parser.add_argument("--all", action="store_true", help="Recalcula todas as temporadas")
     parser.add_argument("--upcoming", action="store_true", help="Calcula features para jogos futuros")
     args = parser.parse_args()
 
+    league = args.league
     sb = get_supabase()
 
     if args.all:
-        seasons = [2020, 2021, 2022, 2023, 2024]
+        seasons = [2020, 2021, 2022, 2023, 2024, 2025, 2026]
     else:
         seasons = args.seasons or [datetime.now().year]
 
-    log.info(f"Calculando features para temporadas: {seasons}")
+    log.info(f"Liga: {league} | Temporadas: {seasons}")
 
-    # Carrega dados históricos (football-data.org)
+    # Carrega dados históricos filtrados pela liga
     all_seasons = list(range(min(seasons) - 2, max(seasons) + 1))
-    df_all = load_matches(sb, all_seasons)
-    log.info(f"  {len(df_all)} partidas (football-data) carregadas")
+    df_all = load_matches(sb, all_seasons, league)
+    log.info(f"  {len(df_all)} partidas ({league}) carregadas")
 
     # Carrega dados enriquecidos (Base dos Dados + FBref)
     df_xg    = load_xg_profiles(sb)
@@ -480,7 +485,7 @@ if __name__ == "__main__":
 
     if args.upcoming:
         current_year = datetime.now().year
-        df_scheduled = load_scheduled(sb, current_year)
+        df_scheduled = load_scheduled(sb, current_year, league)
         if not df_scheduled.empty:
             log.info(f"  {len(df_scheduled)} jogos futuros para calcular features")
             rows = build_features_for_matches(
