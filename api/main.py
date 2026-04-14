@@ -831,12 +831,21 @@ def setup_league(
             "error": None,
         })
 
-    # Define temporadas a coletar
+    # Ligas cross-year (temporada começa no ano anterior ao término)
+    # Ex: PL 2025-26 → season_id = 2025 na API
+    CROSS_YEAR_LEAGUES = {"PL", "PD", "SA", "FL1", "BL1", "CL", "DED", "PPL", "ELC"}
+
     current_year = datetime.now().year
     if seasons:
         season_list = [s.strip() for s in seasons.split(",")]
     else:
-        season_list = [str(current_year - 2), str(current_year - 1), str(current_year)]
+        if league in CROSS_YEAR_LEAGUES:
+            # Para ligas cross-year: temporada atual = ano anterior
+            # Em abril/2026 a PL 25-26 usa season=2025
+            current_season = current_year - 1
+        else:
+            current_season = current_year
+        season_list = [str(current_season - 2), str(current_season - 1), str(current_season)]
 
     def _run():
         try:

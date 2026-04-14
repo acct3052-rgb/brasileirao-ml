@@ -463,7 +463,9 @@ if __name__ == "__main__":
     sb = get_supabase()
 
     if args.all:
-        seasons = [2020, 2021, 2022, 2023, 2024, 2025, 2026]
+        # Inclui desde 2018 até o ano atual para cobrir todas as ligas e temporadas cross-year
+        current = datetime.now().year
+        seasons = list(range(2018, current + 1))
     else:
         seasons = args.seasons or [datetime.now().year]
 
