@@ -730,7 +730,7 @@ def list_bets(sb: Client = Depends(get_supabase)):
     """Lista todas as apostas do usuário com dados do jogo."""
     resp = (
         sb.table("user_bets")
-        .select("*, matches!inner(match_date, status, result, home_team:home_team_id(name), away_team:away_team_id(name))")
+        .select("*, matches(match_date, status, result, home_team:home_team_id(name), away_team:away_team_id(name))")
         .order("created_at", desc=True)
         .execute()
     )
