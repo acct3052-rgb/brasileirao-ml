@@ -750,9 +750,20 @@ def update_results(sb: Client = Depends(get_supabase)):
 
 # ── Retreinamento com status ───────────────────────────────────────────────────
 
+_setup_state: dict = {
+    "status": "idle",
+    "league": None,
+    "step": None,
+    "started_at": None,
+    "finished_at": None,
+    "error": None,
+}
+_setup_lock = threading.Lock()
+
+
 @app.post("/api/retrain")
 def retrain(background_tasks: BackgroundTasks, league: str = "BSA", _=Depends(verify_admin)):
-    """Retreina o modelo de uma liga: build_features + train_model. Retorna imediatamente."""
+    """Retreina o modelo de uma liga: build_features --all + train_model."""
     with _retrain_lock:
         if _retrain_state["status"] == "running":
             raise HTTPException(409, "Treinamento já em andamento")
@@ -790,6 +801,88 @@ def retrain_status(_=Depends(verify_admin)):
     """Retorna o estado atual do retreinamento."""
     with _retrain_lock:
         return dict(_retrain_state)
+
+
+@app.post("/api/setup-league")
+def setup_league(
+    background_tasks: BackgroundTasks,
+    league: str = "PL",
+    seasons: str = "",        # ex: "2022,2023,2024" — vazio = últimas 3 temporadas
+    _=Depends(verify_admin),
+):
+    """
+    Setup completo de uma liga nova:
+    1. Coleta dados históricos (collect_data)
+    2. Calcula features (build_features --all)
+    3. Treina modelo (train_model)
+
+    Use este endpoint para ligas novas. Para retreinar uma liga já configurada,
+    use /api/retrain.
+    """
+    with _setup_lock:
+        if _setup_state["status"] == "running":
+            raise HTTPException(409, "Setup já em andamento")
+        _setup_state.update({
+            "status": "running",
+            "league": league,
+            "step": "iniciando",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": None,
+            "error": None,
+        })
+
+    # Define temporadas a coletar
+    current_year = datetime.now().year
+    if seasons:
+        season_list = [s.strip() for s in seasons.split(",")]
+    else:
+        season_list = [str(current_year - 2), str(current_year - 1), str(current_year)]
+
+    def _run():
+        try:
+            # 1. Coleta histórica
+            log.info(f"[setup-league {league}] Coletando temporadas: {season_list}")
+            _setup_state["step"] = f"coletando dados ({', '.join(season_list)})"
+            collect_args = ["python", "scripts/collect_data.py", f"--league={league}"]
+            for s in season_list:
+                collect_args += ["--season", s]
+            subprocess.run(collect_args, check=True)
+
+            # 2. Features
+            log.info(f"[setup-league {league}] Calculando features")
+            _setup_state["step"] = "calculando features"
+            subprocess.run(["python", "scripts/build_features.py", "--all", f"--league={league}"], check=True)
+
+            # 3. Treino
+            log.info(f"[setup-league {league}] Treinando modelo")
+            _setup_state["step"] = "treinando modelo"
+            subprocess.run(["python", "scripts/train_model.py", f"--league={league}"], check=True)
+
+            # 4. Carrega modelos
+            models_by_league[league] = load_models_for_league(league)
+
+            with _setup_lock:
+                _setup_state.update({
+                    "status": "done",
+                    "step": "concluído",
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                })
+            log.info(f"[setup-league {league}] Setup concluído")
+
+        except Exception as e:
+            with _setup_lock:
+                _setup_state.update({"status": "error", "step": "erro", "error": str(e)})
+            log.error(f"[setup-league {league}] Falhou: {e}")
+
+    background_tasks.add_task(_run)
+    return {"status": "running", "league": league, "seasons": season_list}
+
+
+@app.get("/api/setup-league/status")
+def setup_league_status(_=Depends(verify_admin)):
+    """Retorna o estado atual do setup de liga."""
+    with _setup_lock:
+        return dict(_setup_state)
 
 
 # ── Apostas (Bankroll Tracker) ────────────────────────────────────────────────
