@@ -715,11 +715,14 @@ def retrain_status(_=Depends(verify_admin)):
 # ── Apostas (Bankroll Tracker) ────────────────────────────────────────────────
 
 class BetCreate(BaseModel):
-    match_id: int
-    bet_outcome: Literal["H", "D", "A"]
+    match_id: int | None = None          # None quando é múltipla
+    bet_outcome: str                      # H, D, A, over_15, over_25, btts, combo
     odd: float
     stake: float
     notes: str | None = None
+    market: str = "result"               # result | over_15 | over_25 | btts | combo
+    is_combo: bool = False               # múltipla
+    combo_description: str | None = None # ex: "Flamengo + Over 1.5 + Santos"
 
 
 @app.get("/api/bets")
@@ -737,15 +740,28 @@ def list_bets(sb: Client = Depends(get_supabase)):
 @app.post("/api/bets")
 def create_bet(req: BetCreate, sb: Client = Depends(get_supabase)):
     """Registra uma nova aposta, capturando snapshot das probabilidades do modelo."""
-    pred_resp = (
-        sb.table("predictions")
-        .select("prob_home, prob_draw, prob_away, predicted_result")
-        .eq("match_id", req.match_id)
-        .maybe_single()
-        .execute()
-    )
-    pred = pred_resp.data or {}
-    prob_map = {"H": pred.get("prob_home"), "D": pred.get("prob_draw"), "A": pred.get("prob_away")}
+    model_prob = None
+    model_pick = None
+
+    if req.match_id and not req.is_combo:
+        pred_resp = (
+            sb.table("predictions")
+            .select("prob_home, prob_draw, prob_away, predicted_result, over_15_prob, over_25_prob, btts_prob")
+            .eq("match_id", req.match_id)
+            .maybe_single()
+            .execute()
+        )
+        pred = pred_resp.data or {}
+        prob_map = {
+            "H": pred.get("prob_home"),
+            "D": pred.get("prob_draw"),
+            "A": pred.get("prob_away"),
+            "over_15": pred.get("over_15_prob"),
+            "over_25": pred.get("over_25_prob"),
+            "btts": pred.get("btts_prob"),
+        }
+        model_prob = prob_map.get(req.bet_outcome)
+        model_pick = pred.get("predicted_result")
 
     data = {
         "match_id": req.match_id,
@@ -753,8 +769,11 @@ def create_bet(req: BetCreate, sb: Client = Depends(get_supabase)):
         "odd": req.odd,
         "stake": req.stake,
         "notes": req.notes,
-        "model_prob": prob_map.get(req.bet_outcome),
-        "model_pick": pred.get("predicted_result"),
+        "model_prob": model_prob,
+        "model_pick": model_pick,
+        "market": req.market,
+        "is_combo": req.is_combo,
+        "combo_description": req.combo_description,
     }
     resp = sb.table("user_bets").insert(data).execute()
     return resp.data[0]
