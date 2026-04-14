@@ -776,8 +776,12 @@ def create_bet(req: BetCreate, sb: Client = Depends(get_supabase)):
     }
     if req.match_id is not None:
         data["match_id"] = req.match_id
-    resp = sb.table("user_bets").insert(data).execute()
-    return resp.data[0]
+    try:
+        resp = sb.table("user_bets").insert(data).execute()
+        return resp.data[0]
+    except Exception as e:
+        log.error(f"create_bet error: {e} | data: {data}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/api/bets/{bet_id}")
