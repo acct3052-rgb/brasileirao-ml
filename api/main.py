@@ -703,6 +703,70 @@ def predict_batch(season: int | None = None, league: str = "BSA", sb: Client = D
     return {"predicted": len(results), "details": results}
 
 
+@app.post("/api/predict/all")
+def predict_all(league: str = "BSA", _=Depends(verify_admin), sb: Client = Depends(get_supabase)):
+    """
+    Gera predições para TODOS os jogos com features disponíveis (históricos + futuros).
+    Útil após setup de nova liga para popular o histórico de acurácia.
+    """
+    m = get_models(league)
+    if not m.get("result_model"):
+        raise HTTPException(503, f"Modelo não carregado para liga {league}")
+
+    features_resp = (
+        sb.table("match_features")
+        .select("*")
+        .eq("league", league)
+        .execute()
+    )
+
+    predicted_ids = {
+        r["match_id"] for r in
+        sb.table("predictions").select("match_id").eq("league", league).execute().data
+    }
+
+    to_predict = [r for r in (features_resp.data or []) if r["match_id"] not in predicted_ids]
+    log.info(f"[predict/all {league}] {len(to_predict)} jogos para predizer")
+
+    ok = 0
+    errors = 0
+    for features in to_predict:
+        try:
+            pred = predict_from_features(features, league)
+            sb.table("predictions").upsert(
+                {**pred, "match_id": features["match_id"], "model_version": "1.0", "league": league},
+                on_conflict="match_id"
+            ).execute()
+            ok += 1
+        except Exception as e:
+            log.warning(f"[predict/all {league}] match {features.get('match_id')}: {e}")
+            errors += 1
+
+    # Atualiza actual_result para jogos já finalizados
+    finished_resp = (
+        sb.table("predictions")
+        .select("match_id, predicted_result, matches!inner(result, status)")
+        .eq("league", league)
+        .is_("actual_result", "null")
+        .execute()
+    )
+    results_updated = 0
+    for row in (finished_resp.data or []):
+        match_data = row.get("matches", {})
+        if match_data.get("status") != "FINISHED":
+            continue
+        actual = match_data.get("result")
+        if not actual:
+            continue
+        correct = actual == row["predicted_result"]
+        sb.table("predictions").update(
+            {"actual_result": actual, "correct": correct}
+        ).eq("match_id", row["match_id"]).execute()
+        results_updated += 1
+
+    return {"league": league, "predicted": ok, "errors": errors, "results_updated": results_updated}
+
+
 @app.post("/api/update-results")
 def update_results(sb: Client = Depends(get_supabase)):
     """Atualiza actual_result nas predições e status nas apostas do usuário."""
