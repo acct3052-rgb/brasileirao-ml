@@ -840,6 +840,16 @@ def retrain(background_tasks: BackgroundTasks, league: str = "BSA", _=Depends(ve
 
     def _run():
         try:
+            # Atualiza xG do FBref antes de recalcular features
+            log.info(f"Retreinamento [{league}]: collect_soccerdata")
+            try:
+                subprocess.run(
+                    ["python", "scripts/collect_soccerdata.py", f"--league={league}", "--all"],
+                    check=True, timeout=600
+                )
+            except Exception as e:
+                log.warning(f"Retreinamento [{league}]: xG collection falhou (não crítico): {e}")
+
             log.info(f"Retreinamento [{league}]: build_features --all")
             subprocess.run(["python", "scripts/build_features.py", "--all", f"--league={league}"], check=True)
             log.info(f"Retreinamento [{league}]: train_model")
@@ -948,6 +958,17 @@ def setup_league(
             for s in season_list:
                 collect_args += ["--season", s]
             subprocess.run(collect_args, check=True)
+
+            # 1b. Coleta xG/stats avançadas do FBref (se liga suportada)
+            log.info(f"[setup-league {league}] Coletando xG do FBref")
+            _setup_state["step"] = "coletando xG (FBref)"
+            xg_args = ["python", "scripts/collect_soccerdata.py", f"--league={league}"]
+            for s in season_list:
+                xg_args += ["--season", s]
+            try:
+                subprocess.run(xg_args, check=True, timeout=600)
+            except Exception as e:
+                log.warning(f"[setup-league {league}] xG collection falhou (não crítico): {e}")
 
             # 2. Features
             log.info(f"[setup-league {league}] Calculando features")

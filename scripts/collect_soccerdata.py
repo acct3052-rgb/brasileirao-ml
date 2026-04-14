@@ -45,20 +45,30 @@ log = logging.getLogger(__name__)
 CACHE_DIR = Path("data/soccerdata_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# FBref identifica o Brasileirão como "BRA-Serie A"
-FBREF_LEAGUE = "BRA-Serie A"
+# Mapeamento de código de liga → nome FBref
+FBREF_LEAGUES: dict[str, str] = {
+    "BSA": "BRA-Serie A",
+    "PL":  "ENG-Premier League",
+    "PD":  "ESP-La Liga",
+    "SA":  "ITA-Serie A",
+    "FL1": "FRA-Ligue 1",
+    "BL1": "GER-Bundesliga",
+    "DED": "NED-Eredivisie",
+    "PPL": "POR-Primeira Liga",
+    "ELC": "ENG-Championship",
+}
 
-# Temporadas disponíveis no FBref para o Brasileirão
 FBREF_MIN_SEASON = 2017
 
 
 # ── SoccerData client ──────────────────────────────────────────────────────────
 
-def get_fbref(seasons: list[int]):
+def get_fbref(league: str, seasons: list[int]):
     try:
         import soccerdata as sd
+        fbref_league = FBREF_LEAGUES.get(league, "BRA-Serie A")
         fbref = sd.FBref(
-            leagues=FBREF_LEAGUE,
+            leagues=fbref_league,
             seasons=seasons,
             data_dir=CACHE_DIR,
         )
@@ -302,21 +312,25 @@ def upsert_team_xg_profiles(sb: Client, profiles: list[dict]) -> None:
 
 # ── Pipeline principal ─────────────────────────────────────────────────────────
 
-def run_soccerdata_collection(seasons: list[int]) -> None:
+def run_soccerdata_collection(seasons: list[int], league: str = "BSA") -> None:
+    if league not in FBREF_LEAGUES:
+        log.warning(f"Liga {league} não suportada no FBref. Ligas disponíveis: {list(FBREF_LEAGUES.keys())}")
+        return
+
     # Filtra temporadas disponíveis no FBref
     valid_seasons = [s for s in seasons if s >= FBREF_MIN_SEASON]
     if not valid_seasons:
-        log.warning(f"FBref só tem dados do Brasileirão a partir de {FBREF_MIN_SEASON}")
+        log.warning(f"FBref só tem dados a partir de {FBREF_MIN_SEASON}")
         return
 
-    log.info(f"── SoccerData/FBref: {valid_seasons} ──────────────────")
+    log.info(f"── SoccerData/FBref: {league} {valid_seasons} ──────────────────")
     sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
     for season in valid_seasons:
         log.info(f"\n── Temporada {season} ──")
 
         try:
-            fbref = get_fbref([season])
+            fbref = get_fbref(league, [season])
 
             # xG por partida
             df_schedule = fetch_match_xg(fbref)
@@ -347,6 +361,7 @@ def run_soccerdata_collection(seasons: list[int]) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Coleta stats avançadas via SoccerData/FBref")
+    parser.add_argument("--league", type=str, default="BSA", help="Código da liga (ex: BSA, PL)")
     parser.add_argument("--season", type=int, action="append", dest="seasons")
     parser.add_argument(
         "--all", action="store_true",
@@ -359,4 +374,4 @@ if __name__ == "__main__":
     else:
         seasons = args.seasons or [datetime.now().year]
 
-    run_soccerdata_collection(seasons)
+    run_soccerdata_collection(seasons, league=args.league)
