@@ -485,9 +485,13 @@ if __name__ == "__main__":
     resp_teams = sb.table("teams").select("id, name").execute()
     team_name_map = {r["id"]: r["name"] for r in resp_teams.data} if resp_teams.data else {}
 
+    # Ligas cross-year: temporada atual = ano anterior (ex: PL 25-26 → season=2025)
+    CROSS_YEAR_LEAGUES = {"PL", "PD", "SA", "FL1", "BL1", "CL", "DED", "PPL", "ELC"}
+    current_year = datetime.now().year
+    current_season = (current_year - 1) if league in CROSS_YEAR_LEAGUES else current_year
+
     if args.upcoming:
-        current_year = datetime.now().year
-        df_scheduled = load_scheduled(sb, current_year, league)
+        df_scheduled = load_scheduled(sb, current_season, league)
         if not df_scheduled.empty:
             log.info(f"  {len(df_scheduled)} jogos futuros para calcular features")
             rows = build_features_for_matches(
@@ -500,5 +504,14 @@ if __name__ == "__main__":
             df_all, df_target, df_xg, df_stats, team_name_map
         )
         save_features(sb, rows)
+
+        # Também gera features para jogos futuros da temporada atual
+        df_scheduled = load_scheduled(sb, current_season, league)
+        if not df_scheduled.empty:
+            log.info(f"  {len(df_scheduled)} jogos futuros para calcular features")
+            rows_sched = build_features_for_matches(
+                df_all, df_scheduled, df_xg, df_stats, team_name_map
+            )
+            save_features(sb, rows_sched)
 
     log.info("Features concluídas")
