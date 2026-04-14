@@ -670,7 +670,7 @@ def predict_batch(season: int | None = None, league: str = "BSA", sb: Client = D
     if not m.get("result_model"):
         raise HTTPException(503, f"Modelo não carregado para liga {league}")
 
-    query = sb.table("match_features").select("*, matches!inner(status, season)")
+    query = sb.table("match_features").select("*, matches!inner(status, season, league)").eq("league", league)
     if season:
         query = query.eq("season", season)
     resp = query.execute()
@@ -691,9 +691,9 @@ def predict_batch(season: int | None = None, league: str = "BSA", sb: Client = D
     results = []
     for features in to_predict:
         try:
-            pred = predict_from_features(features)
+            pred = predict_from_features(features, league)
             sb.table("predictions").upsert(
-                {**pred, "match_id": features["match_id"], "model_version": "1.0"},
+                {**pred, "match_id": features["match_id"], "model_version": "1.0", "league": league},
                 on_conflict="match_id"
             ).execute()
             results.append({"match_id": features["match_id"], "status": "ok"})
@@ -781,6 +781,34 @@ def retrain(background_tasks: BackgroundTasks, league: str = "BSA", _=Depends(ve
             log.info(f"Retreinamento [{league}]: train_model")
             subprocess.run(["python", "scripts/train_model.py", f"--league={league}"], check=True)
             models_by_league[league] = load_models_for_league(league)
+
+            # Gera predições para jogos agendados após retreinar
+            log.info(f"Retreinamento [{league}]: gerando predições")
+            sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+            features_resp = (
+                sb.table("match_features")
+                .select("*, matches!inner(status, season, league)")
+                .eq("league", league)
+                .execute()
+            )
+            predicted_ids = {
+                r["match_id"] for r in sb.table("predictions").select("match_id").execute().data
+            }
+            to_predict = [
+                r for r in (features_resp.data or [])
+                if r["match_id"] not in predicted_ids
+                and r.get("matches", {}).get("status") in ("SCHEDULED", "TIMED")
+            ]
+            for features in to_predict:
+                try:
+                    pred = predict_from_features(features, league)
+                    sb.table("predictions").upsert(
+                        {**pred, "match_id": features["match_id"], "model_version": "1.0", "league": league},
+                        on_conflict="match_id"
+                    ).execute()
+                except Exception as e:
+                    log.warning(f"[retrain {league}] Predição falhou match {features.get('match_id')}: {e}")
+
             with _retrain_lock:
                 _retrain_state.update({
                     "status": "done",
@@ -869,6 +897,33 @@ def setup_league(
 
             # 4. Carrega modelos
             models_by_league[league] = load_models_for_league(league)
+
+            # 5. Gera predições para jogos agendados da liga
+            log.info(f"[setup-league {league}] Gerando predições")
+            _setup_state["step"] = "gerando predições"
+            sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+            query = sb.table("match_features").select("*, matches!inner(status, season, league)").eq("league", league)
+            features_resp = query.execute()
+            predicted_ids = {
+                r["match_id"] for r in sb.table("predictions").select("match_id").execute().data
+            }
+            to_predict = [
+                r for r in (features_resp.data or [])
+                if r["match_id"] not in predicted_ids
+                and r.get("matches", {}).get("status") in ("SCHEDULED", "TIMED")
+            ]
+            pred_count = 0
+            for features in to_predict:
+                try:
+                    pred = predict_from_features(features, league)
+                    sb.table("predictions").upsert(
+                        {**pred, "match_id": features["match_id"], "model_version": "1.0", "league": league},
+                        on_conflict="match_id"
+                    ).execute()
+                    pred_count += 1
+                except Exception as e:
+                    log.warning(f"[setup-league {league}] Predição falhou match {features.get('match_id')}: {e}")
+            log.info(f"[setup-league {league}] {pred_count} predições geradas")
 
             with _setup_lock:
                 _setup_state.update({
