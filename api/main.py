@@ -1203,17 +1203,33 @@ def _best_bookmaker(bookmakers: list) -> dict | None:
     return bookmakers[0] if bookmakers else None
 
 
+# Mapeamento liga → sport key da The Odds API
+ODDS_API_SPORT_KEYS: dict[str, str] = {
+    "BSA": "soccer_brazil_campeonato",
+    "PL":  "soccer_epl",
+    "PD":  "soccer_spain_la_liga",
+    "SA":  "soccer_italy_serie_a",
+    "FL1": "soccer_france_ligue_one",
+    "BL1": "soccer_germany_bundesliga",
+    "DED": "soccer_netherlands_eredivisie",
+    "PPL": "soccer_portugal_primeira_liga",
+    "ELC": "soccer_england_championship",
+    "CL":  "soccer_uefa_champs_league",
+}
+
+
 @app.get("/api/odds")
-async def get_odds(sb: Client = Depends(get_supabase)):
+async def get_odds(league: str = "BSA", sb: Client = Depends(get_supabase)):
     """
-    Busca odds de mercado (h2h + totals) da The Odds API para o Brasileirão.
+    Busca odds de mercado (h2h + totals) da The Odds API.
     Complementa com cálculos Poisson do modelo para over 1.5 e BTTS.
     """
     api_key = os.environ.get("ODDS_API_KEY")
     if not api_key:
         raise HTTPException(503, "ODDS_API_KEY não configurada")
 
-    url = "https://api.the-odds-api.com/v4/sports/soccer_brazil_campeonato/odds"
+    sport_key = ODDS_API_SPORT_KEYS.get(league, "soccer_brazil_campeonato")
+    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
     params = {
         "apiKey": api_key,
         "regions": "eu",
@@ -1232,7 +1248,8 @@ async def get_odds(sb: Client = Depends(get_supabase)):
     # Busca predições com expected goals para os jogos disponíveis
     preds_resp = (
         sb.table("predictions")
-        .select("match_id, expected_goals_home, expected_goals_away, matches!inner(home_team:home_team_id(name), away_team:away_team_id(name), status)")
+        .select("match_id, expected_goals_home, expected_goals_away, over_15_prob, over_25_prob, btts_prob, matches!inner(home_team:home_team_id(name), away_team:away_team_id(name), status, league)")
+        .eq("league", league)
         .in_("matches.status", ["TIMED", "SCHEDULED"])
         .execute()
     )
