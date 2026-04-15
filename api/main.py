@@ -552,7 +552,7 @@ def get_goals_lines(match_id: int, sb: Client = Depends(get_supabase)):
 
 
 @app.get("/api/accuracy/by-round/{season}/{matchday}")
-def get_round_detail(season: int, matchday: int, sb: Client = Depends(get_supabase)):
+def get_round_detail(season: int, matchday: int, league: str = "BSA", sb: Client = Depends(get_supabase)):
     """Detalhe jogo a jogo de uma rodada — acertos e erros."""
     # 1. Busca match_ids da rodada
     matches_resp = (
@@ -560,6 +560,7 @@ def get_round_detail(season: int, matchday: int, sb: Client = Depends(get_supaba
         .select("id, match_date, home_goals, away_goals, home_team:home_team_id(name), away_team:away_team_id(name)")
         .eq("season", season)
         .eq("matchday", matchday)
+        .eq("league", league)
         .execute()
     )
     match_ids = [m["id"] for m in (matches_resp.data or [])]
@@ -1442,18 +1443,37 @@ def get_odds_history(
 # ── Análise por time ──────────────────────────────────────────────────────────
 
 @app.get("/api/teams")
-def list_teams(sb: Client = Depends(get_supabase)):
-    """Lista todos os times com dados da temporada atual."""
-    resp = sb.table("teams").select("id, name").order("name").execute()
-    return {"teams": resp.data}
+def list_teams(league: str = "BSA", sb: Client = Depends(get_supabase)):
+    """Lista times que têm partidas na liga especificada."""
+    resp = (
+        sb.table("matches")
+        .select("home_team_id, away_team_id")
+        .eq("league", league)
+        .limit(1000)
+        .execute()
+    )
+    team_ids = set()
+    for m in (resp.data or []):
+        if m.get("home_team_id"): team_ids.add(m["home_team_id"])
+        if m.get("away_team_id"): team_ids.add(m["away_team_id"])
+    if not team_ids:
+        return {"teams": []}
+    teams_resp = sb.table("teams").select("id, name").in_("id", list(team_ids)).order("name").execute()
+    return {"teams": teams_resp.data}
 
 
 @app.get("/api/teams/{team_name}/profile")
-def team_profile(team_name: str, season: int = 2026, sb: Client = Depends(get_supabase)):
+def team_profile(team_name: str, league: str = "BSA", season: int | None = None, sb: Client = Depends(get_supabase)):
     """
     Perfil completo de um time: forma recente, gols esperados,
     rendimento casa/fora e próximos jogos com predição.
     """
+    # Determina season atual para a liga
+    CROSS_YEAR_LEAGUES = {"PL", "PD", "SA", "FL1", "BL1", "CL", "DED", "PPL", "ELC"}
+    current_year = datetime.now().year
+    if season is None:
+        season = (current_year - 1) if league in CROSS_YEAR_LEAGUES else current_year
+
     # Busca o time
     team_resp = sb.table("teams").select("id, name").ilike("name", f"%{team_name}%").limit(1).execute()
     if not team_resp.data:
@@ -1467,6 +1487,7 @@ def team_profile(team_name: str, season: int = 2026, sb: Client = Depends(get_su
         .select("id, match_date, matchday, result, home_goals, away_goals, status, away_team:away_team_id(name)")
         .eq("home_team_id", team_id)
         .eq("season", season)
+        .eq("league", league)
         .eq("status", "FINISHED")
         .order("match_date", desc=True)
         .limit(10)
@@ -1477,6 +1498,7 @@ def team_profile(team_name: str, season: int = 2026, sb: Client = Depends(get_su
         .select("id, match_date, matchday, result, home_goals, away_goals, status, home_team:home_team_id(name)")
         .eq("away_team_id", team_id)
         .eq("season", season)
+        .eq("league", league)
         .eq("status", "FINISHED")
         .order("match_date", desc=True)
         .limit(10)
@@ -1503,6 +1525,7 @@ def team_profile(team_name: str, season: int = 2026, sb: Client = Depends(get_su
         sb.table("upcoming_predictions")
         .select("*")
         .eq("home_team", team["name"])
+        .eq("league", league)
         .limit(3)
         .execute()
     )
@@ -1510,6 +1533,7 @@ def team_profile(team_name: str, season: int = 2026, sb: Client = Depends(get_su
         sb.table("upcoming_predictions")
         .select("*")
         .eq("away_team", team["name"])
+        .eq("league", league)
         .limit(3)
         .execute()
     )
