@@ -20,6 +20,8 @@ import pandas as pd
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
+from scripts.feature_config import CROSS_YEAR_LEAGUES
+
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -486,7 +488,6 @@ if __name__ == "__main__":
     team_name_map = {r["id"]: r["name"] for r in resp_teams.data} if resp_teams.data else {}
 
     # Ligas cross-year: temporada atual = ano anterior (ex: PL 25-26 → season=2025)
-    CROSS_YEAR_LEAGUES = {"PL", "PD", "SA", "FL1", "BL1", "CL", "DED", "PPL", "ELC"}
     current_year = datetime.now().year
     current_season = (current_year - 1) if league in CROSS_YEAR_LEAGUES else current_year
 

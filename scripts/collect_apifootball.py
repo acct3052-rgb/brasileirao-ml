@@ -114,7 +114,10 @@ def check_remaining_requests() -> int:
     """Verifica quantas requests restam hoje."""
     resp = requests.get(f"{API_BASE}/status", headers=HEADERS, timeout=10)
     data = resp.json()
-    req = data.get("response", {}).get("requests", {})
+    response = data.get("response", {})
+    if isinstance(response, list):
+        response = response[0] if response else {}
+    req = response.get("requests", {})
     current = req.get("current", 0)
     limit = req.get("limit_day", 100)
     remaining = limit - current

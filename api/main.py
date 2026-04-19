@@ -17,6 +17,7 @@ Endpoints:
 """
 
 import os
+import sys
 import pickle
 import logging
 import subprocess
@@ -36,56 +37,17 @@ from scipy.stats import poisson
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
+# Adiciona raiz do projeto ao path para imports de scripts/
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from scripts.feature_config import FEATURE_COLS, HOME_SPLIT_COLS, AWAY_SPLIT_COLS, CROSS_YEAR_LEAGUES
+
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 MODELS_DIR = "models"
-FEATURE_COLS = [
-    "home_form_pts", "away_form_pts",
-    "home_form_gf",  "away_form_gf",
-    "home_form_ga",  "away_form_ga",
-    "home_home_pts", "away_away_pts",
-    "home_home_gf",  "away_away_gf",
-    "home_home_ga",  "away_away_ga",
-    "h2h_home_wins", "h2h_draws", "h2h_away_wins",
-    "h2h_home_gf_avg", "h2h_away_gf_avg",
-    "home_table_pos", "away_table_pos",
-    "home_table_pts", "away_table_pts",
-    "pos_diff", "pts_diff",
-    "home_avg_xg", "away_avg_xg",
-    "home_avg_xga", "away_avg_xga",
-    "home_xg_net", "away_xg_net",
-    "home_avg_poss",
-    "squad_value_ratio",
-    "home_attendance_pct",
-    "matchday",
-]
-
-HOME_SPLIT_COLS = [
-    "home_form_pts", "home_form_gf", "home_form_ga",
-    "home_home_pts", "home_home_gf", "home_home_ga",
-    "h2h_home_wins", "h2h_draws", "h2h_home_gf_avg",
-    "home_table_pos", "home_table_pts",
-    "pos_diff", "pts_diff",
-    "home_avg_xg", "home_avg_xga", "home_xg_net",
-    "home_avg_poss",
-    "squad_value_ratio",
-    "home_attendance_pct",
-    "matchday",
-]
-
-AWAY_SPLIT_COLS = [
-    "away_form_pts", "away_form_gf", "away_form_ga",
-    "away_away_pts", "away_away_gf", "away_away_ga",
-    "h2h_away_wins", "h2h_draws", "h2h_away_gf_avg",
-    "away_table_pos", "away_table_pts",
-    "pos_diff", "pts_diff",
-    "away_avg_xg", "away_avg_xga",
-    "squad_value_ratio",
-    "home_attendance_pct",
-    "matchday",
-]
+# FEATURE_COLS, HOME_SPLIT_COLS, AWAY_SPLIT_COLS, CROSS_YEAR_LEAGUES
+# importados de scripts/feature_config.py
 
 # Pesos do blend: [resultado_geral, home_split, away_split]
 _BLEND_WEIGHTS = [0.5, 0.25, 0.25]
@@ -654,11 +616,14 @@ def predict_match(req: PredictRequest, sb: Client = Depends(get_supabase)):
     else:
         raise HTTPException(400, "Forneça match_id ou features")
 
-    result = predict_from_features(features)
+    # Detecta a liga do match para carregar o modelo correto
+    league = features.get("league", "BSA") if isinstance(features, dict) else "BSA"
+
+    result = predict_from_features(features, league)
 
     if req.match_id:
         sb.table("predictions").upsert(
-            {**result, "match_id": req.match_id, "model_version": "1.0"},
+            {**result, "match_id": req.match_id, "model_version": "1.0", "league": league},
             on_conflict="match_id"
         ).execute()
 
@@ -677,7 +642,7 @@ def predict_batch(season: int | None = None, league: str = "BSA", sb: Client = D
     resp = query.execute()
 
     predicted_ids = {
-        r["match_id"] for r in sb.table("predictions").select("match_id").execute().data
+        r["match_id"] for r in sb.table("predictions").select("match_id").eq("league", league).execute().data
     }
 
     to_predict = [
@@ -867,7 +832,7 @@ def retrain(background_tasks: BackgroundTasks, league: str = "BSA", _=Depends(ve
                 .execute()
             )
             predicted_ids = {
-                r["match_id"] for r in sb.table("predictions").select("match_id").execute().data
+                r["match_id"] for r in sb.table("predictions").select("match_id").eq("league", league).execute().data
             }
             to_predict = [
                 r for r in (features_resp.data or [])
@@ -936,7 +901,7 @@ def setup_league(
 
     # Ligas cross-year (temporada começa no ano anterior ao término)
     # Ex: PL 2025-26 → season_id = 2025 na API
-    CROSS_YEAR_LEAGUES = {"PL", "PD", "SA", "FL1", "BL1", "CL", "DED", "PPL", "ELC"}
+
 
     current_year = datetime.now().year
     if seasons:
@@ -991,7 +956,7 @@ def setup_league(
             query = sb.table("match_features").select("*, matches!inner(status, season, league)").eq("league", league)
             features_resp = query.execute()
             predicted_ids = {
-                r["match_id"] for r in sb.table("predictions").select("match_id").execute().data
+                r["match_id"] for r in sb.table("predictions").select("match_id").eq("league", league).execute().data
             }
             to_predict = [
                 r for r in (features_resp.data or [])
@@ -1486,7 +1451,7 @@ def team_profile(team_name: str, league: str = "BSA", season: int | None = None,
     rendimento casa/fora e próximos jogos com predição.
     """
     # Determina season atual para a liga
-    CROSS_YEAR_LEAGUES = {"PL", "PD", "SA", "FL1", "BL1", "CL", "DED", "PPL", "ELC"}
+
     current_year = datetime.now().year
     if season is None:
         season = (current_year - 1) if league in CROSS_YEAR_LEAGUES else current_year
@@ -1562,15 +1527,15 @@ def team_profile(team_name: str, league: str = "BSA", season: int | None = None,
     # Features mais recentes do time (para forma atual)
     feat_home = (
         sb.table("match_features")
-        .select("home_form_pts,home_form_gf,home_form_ga,home_home_pts,home_home_gf,home_home_ga,home_table_pos,home_table_pts,home_avg_xg,home_avg_xga,matches!inner(match_date,status)")
+        .select("home_form_pts,home_form_gf,home_form_ga,home_home_pts,home_home_gf,home_home_ga,home_table_pos,home_table_pts,home_avg_xg,home_avg_xga,matches!inner(match_date,status,home_team_id)")
         .eq("matches.status", "SCHEDULED")
+        .eq("matches.home_team_id", team_id)
+        .eq("league", league)
+        .order("matches.match_date", desc=True)  # type: ignore[arg-type]
+        .limit(1)
         .execute()
     )
-    # Pega features mais recentes para este time como mandante
-    latest_feat = next(
-        (f for f in sorted(feat_home.data, key=lambda x: x.get("matches", {}).get("match_date", ""), reverse=True)
-         if True), None
-    )
+    latest_feat = feat_home.data[0] if feat_home.data else None
 
     # Resumo estatístico
     def stats(matches: list, venue: str | None = None):
@@ -1627,14 +1592,16 @@ def _apply_injury_adjustment(
     for inj in home_injuries:
         pos = inj.get("player_position", "")
         impact = _INJURY_IMPACT.get(pos, {})
-        lambda_home = max(0.1, lambda_home + impact.get("home_gf", 0))
-        lambda_away = max(0.1, lambda_away - impact.get("home_ga", 0) * -1)
+        # Ausência em casa: reduz gols do mandante, aumenta gols do visitante
+        lambda_home = max(0.1, lambda_home + impact.get("home_gf", 0))  # home_gf é negativo → reduz
+        lambda_away = max(0.1, lambda_away + impact.get("home_ga", 0))  # home_ga é positivo → aumenta
 
     for inj in away_injuries:
         pos = inj.get("player_position", "")
         impact = _INJURY_IMPACT.get(pos, {})
-        lambda_away = max(0.1, lambda_away + impact.get("away_gf", 0))
-        lambda_home = max(0.1, lambda_home - impact.get("away_ga", 0) * -1)
+        # Ausência fora: reduz gols do visitante, aumenta gols do mandante
+        lambda_away = max(0.1, lambda_away + impact.get("away_gf", 0))  # away_gf é negativo → reduz
+        lambda_home = max(0.1, lambda_home + impact.get("away_ga", 0))  # away_ga é positivo → aumenta
 
     return lambda_home, lambda_away
 
@@ -1683,9 +1650,10 @@ def predict_with_lineup(match_id: int, sb: Client = Depends(get_supabase)):
         raise HTTPException(404, f"Features não encontradas para match_id={match_id}")
 
     features = feat_resp.data
+    league = features.get("league", "BSA")
 
     # Predição base (sem ajuste)
-    base_pred = predict_from_features(features)
+    base_pred = predict_from_features(features, league)
     lh_base = base_pred["expected_goals_home"]
     la_base = base_pred["expected_goals_away"]
 
@@ -1805,19 +1773,19 @@ def trigger_collect_injuries(
 # ── ETL ───────────────────────────────────────────────────────────────────────
 
 @app.post("/api/run-etl")
-def run_etl(background_tasks: BackgroundTasks, _=Depends(verify_admin)):
-    """Dispara coleta de dados + recálculo de features em background."""
+def run_etl(background_tasks: BackgroundTasks, league: str = "BSA", _=Depends(verify_admin)):
+    """Dispara coleta de dados + recálculo de features em background para uma liga."""
     def _run():
-        subprocess.run(["python", "scripts/collect_data.py", "--incremental"], check=True)
-        subprocess.run(["python", "scripts/build_features.py", "--upcoming"], check=True)
-        log.info("ETL concluído")
+        subprocess.run(["python", "scripts/collect_data.py", "--incremental", f"--league={league}"], check=True)
+        subprocess.run(["python", "scripts/build_features.py", "--upcoming", f"--league={league}"], check=True)
+        log.info(f"ETL [{league}] concluído")
 
     background_tasks.add_task(_run)
-    return {"status": "ETL iniciado em background"}
+    return {"status": f"ETL [{league}] iniciado em background"}
 
 
 @app.post("/api/sync-results")
-def sync_results(sb: Client = Depends(get_supabase)):
+def sync_results(league: str = "BSA", sb: Client = Depends(get_supabase)):
     """
     Busca resultados reais na football-data.org e atualiza o Supabase,
     depois marca predições e apostas como corretas/erradas.
@@ -1829,15 +1797,19 @@ def sync_results(sb: Client = Depends(get_supabase)):
     etl_updated = 0
     etl_error = None
 
+    # Ligas cross-year: temporada atual = ano anterior
+
+
     # ── 1. ETL: busca placares finalizados na football-data.org ────────────────
     if football_key:
         try:
-            season = datetime.now(timezone.utc).year
-            url = f"https://api.football-data.org/v4/competitions/BSA/matches?season={season}&status=FINISHED"
+            current_year = datetime.now(timezone.utc).year
+            season = (current_year - 1) if league in CROSS_YEAR_LEAGUES else current_year
+            url = f"https://api.football-data.org/v4/competitions/{league}/matches?season={season}&status=FINISHED"
             resp = req.get(url, headers={"X-Auth-Token": football_key}, timeout=30)
             resp.raise_for_status()
             finished = resp.json().get("matches", [])
-            log.info(f"sync-results: {len(finished)} jogos finalizados na API externa")
+            log.info(f"sync-results [{league}]: {len(finished)} jogos finalizados na API externa")
 
             for m in finished:
                 ext_id = str(m["id"])
@@ -1923,8 +1895,9 @@ def sync_results(sb: Client = Depends(get_supabase)):
 
 class ChatRequest(BaseModel):
     message: str
+    league: str = "BSA"
 
-def _build_chat_context(message: str, sb: Client) -> str:
+def _build_chat_context(message: str, sb: Client, league: str = "BSA") -> str:
     """
     Detecta o tema da pergunta e busca só os dados relevantes.
     Mantém o contexto pequeno para economizar tokens.
@@ -1942,6 +1915,7 @@ def _build_chat_context(message: str, sb: Client) -> str:
             rows = (
                 sb.table("upcoming_predictions")
                 .select("match_id,match_date,matchday,home_team,away_team,prob_home,prob_draw,prob_away,predicted_result,confidence,expected_goals_home,expected_goals_away,over_15_prob,over_25_prob")
+                .eq("league", league)
                 .order("match_date")
                 .limit(20)
                 .execute()
@@ -1952,9 +1926,10 @@ def _build_chat_context(message: str, sb: Client) -> str:
             try:
                 import requests as req
                 odds_key = os.environ.get("ODDS_API_KEY", "")
+                sport_key = ODDS_API_SPORT_KEYS.get(league, "soccer_brazil_campeonato")
                 if odds_key:
                     r = req.get(
-                        "https://api.the-odds-api.com/v4/sports/soccer_brazil_campeonato/odds",
+                        f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds",
                         params={"apiKey": odds_key, "regions": "eu", "markets": "h2h,totals", "oddsFormat": "decimal"},
                         timeout=10
                     )
@@ -2031,7 +2006,7 @@ def _build_chat_context(message: str, sb: Client) -> str:
     # Acurácia geral
     if any(w in msg for w in ["precisão", "acurácia", "acerto", "errou", "acertou", "histór", "resultado", "modelo"]):
         try:
-            acc = (sb.table("predictions").select("correct").not_.is_("correct", "null").execute()).data or []
+            acc = (sb.table("predictions").select("correct").eq("league", league).not_.is_("correct", "null").execute()).data or []
             if acc:
                 total = len(acc)
                 certos = sum(1 for r in acc if r["correct"])
@@ -2048,6 +2023,7 @@ def _build_chat_context(message: str, sb: Client) -> str:
             all_rounds = (
                 sb.table("round_accuracy")
                 .select("season,matchday,total,correct,wrong,accuracy_pct,avg_confidence")
+                .eq("league", league)
                 .order("season", desc=True)
                 .order("matchday", desc=True)
                 .execute()
@@ -2122,7 +2098,7 @@ IS_PICKS_QUESTION = [
     "melhores oportunidades", "apostas da rodada"
 ]
 
-def _build_picks(sb: Client) -> list[dict]:
+def _build_picks(sb: Client, league: str = "BSA") -> list[dict]:
     """
     Monta as 6 melhores apostas da rodada atual, ordenadas por probabilidade decrescente.
     Ignora Over 0.5 (sempre alto). Inclui resultado H/D/A e Over 1.5/2.5/BTTS.
@@ -2138,6 +2114,7 @@ def _build_picks(sb: Client) -> list[dict]:
     all_fixtures = (
         sb.table("upcoming_predictions")
         .select("match_id,match_date,matchday,home_team,away_team,prob_home,prob_draw,prob_away,predicted_result,confidence,expected_goals_home,expected_goals_away,over_15_prob,over_25_prob,btts_prob")
+        .eq("league", league)
         .order("match_date")
         .limit(50)
         .execute()
@@ -2154,9 +2131,10 @@ def _build_picks(sb: Client) -> list[dict]:
     try:
         import requests as req
         odds_key = os.environ.get("ODDS_API_KEY", "")
+        sport_key = ODDS_API_SPORT_KEYS.get(league, "soccer_brazil_campeonato")
         if odds_key:
             r = req.get(
-                "https://api.the-odds-api.com/v4/sports/soccer_brazil_campeonato/odds",
+                f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds",
                 params={"apiKey": odds_key, "regions": "eu", "markets": "h2h,totals", "oddsFormat": "decimal"},
                 timeout=10
             )
@@ -2288,7 +2266,7 @@ async def chat(req: ChatRequest, sb: Client = Depends(get_supabase)):
     picks: list[dict] = []
 
     if is_picks:
-        picks = _build_picks(sb)
+        picks = _build_picks(sb, req.league)
         picks_text = "TOP 6 APOSTAS SELECIONADAS:\n"
         for i, p in enumerate(picks, 1):
             ev_str = f" EV:{'+' if (p['ev'] or 0)>0 else ''}{p['ev']}%" if p['ev'] is not None else " (sem odd de mercado — use odd justa)"
@@ -2297,9 +2275,9 @@ async def chat(req: ChatRequest, sb: Client = Depends(get_supabase)):
                 f"   Mercado: {p['market']} | Prob: {p['prob']}% | Tier: {p['tier']}\n"
                 f"   Odd justa: {p['fair_odd']} | Odd mercado: {p['market_odd'] or 'N/D'}{ev_str}\n"
             )
-        context = _build_chat_context(req.message, sb) + "\n\n" + picks_text
+        context = _build_chat_context(req.message, sb, req.league) + "\n\n" + picks_text
     else:
-        context = _build_chat_context(req.message, sb)
+        context = _build_chat_context(req.message, sb, req.league)
 
     client = anthropic.Anthropic(api_key=api_key)
     response = client.messages.create(
