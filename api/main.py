@@ -1247,7 +1247,109 @@ def recheck_bets(sb: Client = Depends(get_supabase)):
             })
             fixed += 1
 
-    return {"fixed": fixed, "details": details}
+    # ── Resolve apostas combo/múltiplas ──────────────────────────────────────
+    combos_resp = (
+        sb.table("user_bets")
+        .select("id, combo_description, status")
+        .eq("is_combo", True)
+        .eq("status", "pending")
+        .execute()
+    )
+
+    combos_fixed = 0
+    combo_details = []
+    for combo in combos_resp.data:
+        desc = combo.get("combo_description") or ""
+        if not desc:
+            continue
+
+        # Extrai os jogos e mercados da descrição
+        # Formato: "Time A x Time B — Over 1.5 gols + Time C x Time D — Over 1.5 gols"
+        legs = [leg.strip() for leg in desc.split("+")]
+        all_won = True
+        any_pending = False
+        leg_results = []
+
+        for leg in legs:
+            # Tenta extrair o mercado
+            is_over15 = "over 1.5" in leg.lower()
+            is_over25 = "over 2.5" in leg.lower()
+            is_btts = "ambos" in leg.lower() or "btts" in leg.lower()
+
+            if not (is_over15 or is_over25 or is_btts):
+                # Mercado não reconhecido — não pode resolver
+                any_pending = True
+                leg_results.append({"leg": leg, "status": "unknown"})
+                continue
+
+            # Busca o jogo pelos nomes dos times na descrição
+            # Formato: "Time A x Time B — Over 1.5 gols"
+            match_part = leg.split("—")[0].strip() if "—" in leg else leg.split("-")[0].strip()
+            teams = [t.strip() for t in match_part.split(" x ")]
+            if len(teams) != 2:
+                any_pending = True
+                leg_results.append({"leg": leg, "status": "parse_error"})
+                continue
+
+            # Busca o jogo no banco
+            match_resp = (
+                sb.table("matches")
+                .select("id, home_goals, away_goals, status, home_team:home_team_id(name), away_team:away_team_id(name)")
+                .eq("status", "FINISHED")
+                .execute()
+            )
+            found_match = None
+            for mr in match_resp.data:
+                ht = mr.get("home_team", {}).get("name", "")
+                at = mr.get("away_team", {}).get("name", "")
+                if teams[0] in ht and teams[1] in at:
+                    found_match = mr
+                    break
+                if teams[1] in ht and teams[0] in at:
+                    found_match = mr
+                    break
+
+            if not found_match:
+                any_pending = True
+                leg_results.append({"leg": leg, "status": "match_not_found"})
+                continue
+
+            hg = found_match.get("home_goals", 0)
+            ag = found_match.get("away_goals", 0)
+            total = hg + ag
+
+            if is_over15:
+                leg_won = total > 1.5
+            elif is_over25:
+                leg_won = total > 2.5
+            else:  # btts
+                leg_won = hg >= 1 and ag >= 1
+
+            leg_results.append({
+                "leg": leg, "score": f"{hg}-{ag}",
+                "status": "won" if leg_won else "lost",
+            })
+            if not leg_won:
+                all_won = False
+
+        if any_pending:
+            continue
+
+        combo_status = "won" if all_won else "lost"
+        if combo["status"] != combo_status:
+            sb.table("user_bets").update({"status": combo_status}).eq("id", combo["id"]).execute()
+            combo_details.append({
+                "bet_id": combo["id"],
+                "old_status": combo["status"],
+                "new_status": combo_status,
+                "legs": leg_results,
+            })
+            combos_fixed += 1
+
+    return {
+        "fixed": fixed, "details": details,
+        "combos_fixed": combos_fixed, "combo_details": combo_details,
+    }
 
 
 # ── Retreinamento com status ───────────────────────────────────────────────────
