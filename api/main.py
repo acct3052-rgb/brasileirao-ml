@@ -1183,6 +1183,73 @@ def update_results(sb: Client = Depends(get_supabase)):
     return {"updated": updated, "bets_updated": bets_updated}
 
 
+@app.post("/api/bets/recheck")
+def recheck_bets(sb: Client = Depends(get_supabase)):
+    """
+    Re-processa TODAS as apostas de gols (over_15, over_25, btts) que foram
+    marcadas incorretamente como 'lost' pelo bug antigo que comparava
+    bet_outcome com H/D/A em vez de verificar o placar real.
+    """
+    # Busca todas as apostas de gols (não resultado) que já foram resolvidas
+    bets_resp = (
+        sb.table("user_bets")
+        .select("id, match_id, bet_outcome, market, status")
+        .in_("market", ["over_15", "over_25", "btts"])
+        .in_("status", ["won", "lost"])
+        .execute()
+    )
+
+    fixed = 0
+    details = []
+    for bet in bets_resp.data:
+        match_id = bet.get("match_id")
+        if not match_id:
+            continue
+
+        # Busca placar real
+        match_resp = (
+            sb.table("matches")
+            .select("home_goals, away_goals, status")
+            .eq("id", match_id)
+            .maybe_single()
+            .execute()
+        )
+        m = match_resp.data
+        if not m or m.get("status") != "FINISHED":
+            continue
+
+        hg = m.get("home_goals")
+        ag = m.get("away_goals")
+        if hg is None or ag is None:
+            continue
+
+        total_goals = hg + ag
+        market = bet["market"]
+
+        if market == "over_15":
+            correct_status = "won" if total_goals > 1.5 else "lost"
+        elif market == "over_25":
+            correct_status = "won" if total_goals > 2.5 else "lost"
+        elif market == "btts":
+            correct_status = "won" if (hg >= 1 and ag >= 1) else "lost"
+        else:
+            continue
+
+        if bet["status"] != correct_status:
+            sb.table("user_bets").update({"status": correct_status}).eq("id", bet["id"]).execute()
+            details.append({
+                "bet_id": bet["id"],
+                "match_id": match_id,
+                "market": market,
+                "score": f"{hg}-{ag}",
+                "old_status": bet["status"],
+                "new_status": correct_status,
+            })
+            fixed += 1
+
+    return {"fixed": fixed, "details": details}
+
+
 # ── Retreinamento com status ───────────────────────────────────────────────────
 
 _setup_state: dict = {
