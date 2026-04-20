@@ -1250,8 +1250,8 @@ def recheck_bets(sb: Client = Depends(get_supabase)):
     # ── Resolve apostas combo/múltiplas ──────────────────────────────────────
     combos_resp = (
         sb.table("user_bets")
-        .select("id, combo_description, status")
-        .eq("is_combo", True)
+        .select("id, combo_description, status, is_combo")
+        .eq("is_combo", "true")
         .eq("status", "pending")
         .execute()
     )
