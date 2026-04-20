@@ -22,6 +22,7 @@ import pickle
 import logging
 import subprocess
 import threading
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Literal
@@ -127,10 +128,132 @@ def get_models(league: str = "BSA") -> dict:
     return models_by_league[league]
 
 
+# ── Auto-sync scheduler ──────────────────────────────────────────────────────
+
+AUTO_SYNC_ENABLED = os.environ.get("AUTO_SYNC_ENABLED", "true").lower() == "true"
+AUTO_SYNC_INTERVAL_HOURS = int(os.environ.get("AUTO_SYNC_INTERVAL_HOURS", "6"))
+AUTO_SYNC_LEAGUES = os.environ.get("AUTO_SYNC_LEAGUES", "BSA,PL").split(",")
+
+
+async def _auto_sync_loop():
+    """Background loop que sincroniza resultados e gera predições automaticamente."""
+    await asyncio.sleep(30)  # Espera API inicializar completamente
+    log.info(f"[auto-sync] Ativo — intervalo: {AUTO_SYNC_INTERVAL_HOURS}h, ligas: {AUTO_SYNC_LEAGUES}")
+
+    while True:
+        for league in AUTO_SYNC_LEAGUES:
+            league = league.strip()
+            if not league:
+                continue
+            try:
+                log.info(f"[auto-sync] [{league}] Sincronizando resultados...")
+                sb = get_supabase()
+
+                # 1. Sync results (ETL + predições + apostas)
+                current_year = datetime.now(timezone.utc).year
+                football_key = os.environ.get("FOOTBALL_DATA_API_KEY", "")
+                etl_updated = 0
+
+                if football_key:
+                    import requests as req
+                    season = (current_year - 1) if league in CROSS_YEAR_LEAGUES else current_year
+                    url = f"https://api.football-data.org/v4/competitions/{league}/matches?season={season}&status=FINISHED"
+                    resp = req.get(url, headers={"X-Auth-Token": football_key}, timeout=30)
+                    if resp.ok:
+                        finished = resp.json().get("matches", [])
+                        for m in finished:
+                            ext_id = str(m["id"])
+                            score = m.get("score", {}).get("fullTime", {})
+                            hg, ag = score.get("home"), score.get("away")
+                            if hg is None or ag is None:
+                                continue
+                            result = "H" if hg > ag else ("A" if ag > hg else "D")
+                            existing = sb.table("matches").select("id, status, result").eq("id", int(ext_id)).execute()
+                            if not existing.data:
+                                continue
+                            row = existing.data[0]
+                            if row.get("status") == "FINISHED" and row.get("result") == result:
+                                continue
+                            sb.table("matches").update({
+                                "home_goals": hg, "away_goals": ag,
+                                "result": result, "status": "FINISHED",
+                            }).eq("id", int(ext_id)).execute()
+                            etl_updated += 1
+                        log.info(f"[auto-sync] [{league}] {etl_updated} jogos atualizados")
+
+                # 2. Atualiza predições
+                preds = (
+                    sb.table("predictions")
+                    .select("match_id, predicted_result, matches!inner(result, status)")
+                    .eq("league", league)
+                    .is_("actual_result", "null")
+                    .execute()
+                )
+                preds_updated = 0
+                for row in preds.data:
+                    md = row.get("matches", {})
+                    if md.get("status") != "FINISHED":
+                        continue
+                    actual = md.get("result")
+                    if not actual:
+                        continue
+                    correct = actual == row["predicted_result"]
+                    sb.table("predictions").update(
+                        {"actual_result": actual, "correct": correct}
+                    ).eq("match_id", row["match_id"]).execute()
+                    preds_updated += 1
+                log.info(f"[auto-sync] [{league}] {preds_updated} predições atualizadas")
+
+                # 3. Gera predições batch para próximos jogos
+                models = get_models(league)
+                if models.get("result_model"):
+                    feat_resp = (
+                        sb.table("match_features")
+                        .select("*, matches!inner(status, season, league)")
+                        .eq("league", league)
+                        .execute()
+                    )
+                    predicted_ids = {
+                        r["match_id"] for r in
+                        sb.table("predictions").select("match_id").eq("league", league).execute().data
+                    }
+                    to_predict = [
+                        r for r in feat_resp.data
+                        if r["match_id"] not in predicted_ids
+                        and r.get("matches", {}).get("status") in ("SCHEDULED", "TIMED")
+                    ]
+                    new_preds = 0
+                    for row in to_predict:
+                        try:
+                            pred = predict_from_features(row, league)
+                            sb.table("predictions").upsert(
+                                {**pred, "match_id": row["match_id"], "model_version": "auto", "league": league},
+                                on_conflict="match_id"
+                            ).execute()
+                            new_preds += 1
+                        except Exception:
+                            pass
+                    log.info(f"[auto-sync] [{league}] {new_preds} novas predições geradas")
+
+            except Exception as e:
+                log.error(f"[auto-sync] [{league}] Erro: {e}")
+
+        # Aguarda próximo ciclo
+        await asyncio.sleep(AUTO_SYNC_INTERVAL_HOURS * 3600)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_all_models()
+    # Inicia auto-sync em background se habilitado
+    sync_task = None
+    if AUTO_SYNC_ENABLED:
+        sync_task = asyncio.create_task(_auto_sync_loop())
+        log.info("[auto-sync] Scheduler iniciado")
     yield
+    # Cleanup
+    if sync_task:
+        sync_task.cancel()
 
 
 # ── App ────────────────────────────────────────────────────────────────────────
@@ -324,6 +447,11 @@ def health():
     return {
         "status": "ok",
         "models_by_league": summary,
+        "auto_sync": {
+            "enabled": AUTO_SYNC_ENABLED,
+            "interval_hours": AUTO_SYNC_INTERVAL_HOURS,
+            "leagues": AUTO_SYNC_LEAGUES,
+        },
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -510,6 +638,258 @@ def get_goals_lines(match_id: int, sb: Client = Depends(get_supabase)):
         "expected_goals_home":  lh,
         "expected_goals_away":  la,
         "lines":                lines,
+    }
+
+
+@app.get("/api/goals-picks")
+def get_goals_picks(league: str = "BSA", sb: Client = Depends(get_supabase)):
+    """
+    Picks focados APENAS em mercados de gols: Over 1.5, Over 2.5 e BTTS.
+    Retorna apostas classificadas por confiança com EV quando odds de mercado disponíveis.
+    Thresholds calibrados: Over 1.5 ≥ 70%, Over 2.5 ≥ 55%, BTTS ≥ 58%.
+    """
+    import unicodedata
+
+    def _norm(s: str) -> str:
+        s = unicodedata.normalize('NFD', s.lower())
+        s = ''.join(c for c in s if unicodedata.category(c) != 'Mn')
+        return s.replace(' ', '')
+
+    # Busca fixtures futuros com predições
+    all_fixtures = (
+        sb.table("upcoming_predictions")
+        .select("match_id,match_date,matchday,home_team,away_team,expected_goals_home,expected_goals_away,over_15_prob,over_25_prob,btts_prob,confidence")
+        .eq("league", league)
+        .order("match_date")
+        .limit(50)
+        .execute()
+    ).data or []
+
+    if not all_fixtures:
+        return {"picks": [], "round": None, "summary": {}}
+
+    # Filtra rodada mais próxima
+    next_matchday = min(f.get("matchday") or 99 for f in all_fixtures)
+    fixtures = [f for f in all_fixtures if f.get("matchday") == next_matchday]
+
+    # Busca odds de mercado
+    odds_map: dict = {}
+    try:
+        import requests as req_lib
+        odds_key = os.environ.get("ODDS_API_KEY", "")
+        sport_key = ODDS_API_SPORT_KEYS.get(league, "soccer_brazil_campeonato")
+        if odds_key:
+            r = req_lib.get(
+                f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds",
+                params={"apiKey": odds_key, "regions": "eu", "markets": "totals,btts", "oddsFormat": "decimal"},
+                timeout=10
+            )
+            if r.ok:
+                for game in r.json():
+                    best_o15 = best_o25 = best_btts = None
+                    for bk in game.get("bookmakers", []):
+                        for mkt in bk.get("markets", []):
+                            if mkt["key"] == "totals":
+                                for o in mkt["outcomes"]:
+                                    if o["name"] == "Over" and o.get("point") == 1.5:
+                                        best_o15 = max(best_o15 or 0, o["price"])
+                                    if o["name"] == "Over" and o.get("point") == 2.5:
+                                        best_o25 = max(best_o25 or 0, o["price"])
+                            elif mkt["key"] == "btts":
+                                for o in mkt["outcomes"]:
+                                    if o["name"] == "Yes":
+                                        best_btts = max(best_btts or 0, o["price"])
+                    ht = game.get("home_team", "")
+                    at = game.get("away_team", "")
+                    odds_map[(_norm(ht), _norm(at))] = {
+                        "over15": best_o15, "over25": best_o25, "btts": best_btts,
+                    }
+    except Exception as e:
+        log.warning(f"goals-picks odds fetch: {e}")
+
+    picks: list[dict] = []
+
+    for f in fixtures:
+        key = (_norm(f.get("home_team", "")), _norm(f.get("away_team", "")))
+        mkt = odds_map.get(key)
+        xg_h = f.get("expected_goals_home") or 0
+        xg_a = f.get("expected_goals_away") or 0
+        xg_total = round(xg_h + xg_a, 2)
+        match_label = f"{f['home_team']} vs {f['away_team']}"
+        match_date = (f.get("match_date") or "")[:10]
+
+        # Over 1.5 — threshold 70% (calibrado pela observação do usuário)
+        o15 = f.get("over_15_prob") or 0
+        if o15 >= 0.70:
+            fair = round(1 / o15, 2)
+            odd_mkt = mkt.get("over15") if mkt else None
+            ev = round((o15 * odd_mkt - 1) * 100, 1) if odd_mkt else None
+            grade = "A+" if o15 >= 0.85 else "A" if o15 >= 0.78 else "B+"
+            picks.append({
+                "match": match_label, "match_id": f["match_id"],
+                "match_date": match_date, "matchday": f.get("matchday"),
+                "market": "Over 1.5", "prob": round(o15 * 100, 1),
+                "fair_odd": fair, "market_odd": odd_mkt, "ev": ev,
+                "grade": grade, "xg_total": xg_total,
+                "xg_home": round(xg_h, 2), "xg_away": round(xg_a, 2),
+            })
+
+        # Over 2.5 — threshold 55%
+        o25 = f.get("over_25_prob") or 0
+        if o25 >= 0.55:
+            fair = round(1 / o25, 2)
+            odd_mkt = mkt.get("over25") if mkt else None
+            ev = round((o25 * odd_mkt - 1) * 100, 1) if odd_mkt else None
+            grade = "A+" if o25 >= 0.70 else "A" if o25 >= 0.62 else "B+"
+            picks.append({
+                "match": match_label, "match_id": f["match_id"],
+                "match_date": match_date, "matchday": f.get("matchday"),
+                "market": "Over 2.5", "prob": round(o25 * 100, 1),
+                "fair_odd": fair, "market_odd": odd_mkt, "ev": ev,
+                "grade": grade, "xg_total": xg_total,
+                "xg_home": round(xg_h, 2), "xg_away": round(xg_a, 2),
+            })
+
+        # BTTS — threshold 58%
+        btts_val = f.get("btts_prob") or 0
+        if btts_val >= 0.58:
+            fair = round(1 / btts_val, 2)
+            odd_mkt = mkt.get("btts") if mkt else None
+            ev = round((btts_val * odd_mkt - 1) * 100, 1) if odd_mkt else None
+            grade = "A+" if btts_val >= 0.72 else "A" if btts_val >= 0.65 else "B+"
+            picks.append({
+                "match": match_label, "match_id": f["match_id"],
+                "match_date": match_date, "matchday": f.get("matchday"),
+                "market": "BTTS", "prob": round(btts_val * 100, 1),
+                "fair_odd": fair, "market_odd": odd_mkt, "ev": ev,
+                "grade": grade, "xg_total": xg_total,
+                "xg_home": round(xg_h, 2), "xg_away": round(xg_a, 2),
+            })
+
+    # Ordena: primeiro por grade (A+ > A > B+), depois por prob
+    grade_order = {"A+": 3, "A": 2, "B+": 1}
+    picks.sort(key=lambda x: (grade_order.get(x["grade"], 0), x["prob"]), reverse=True)
+
+    # Resumo
+    summary = {
+        "total_picks": len(picks),
+        "by_market": {},
+        "value_bets": sum(1 for p in picks if p.get("ev") and p["ev"] > 0),
+    }
+    for p in picks:
+        m = p["market"]
+        summary["by_market"][m] = summary["by_market"].get(m, 0) + 1
+
+    return {"picks": picks, "round": next_matchday, "league": league, "summary": summary}
+
+
+@app.get("/api/goals-accuracy")
+def get_goals_accuracy(league: str = "BSA", season: int | None = None, sb: Client = Depends(get_supabase)):
+    """
+    Backtesting histórico dos mercados de gols: Over 1.5, Over 2.5 e BTTS.
+    Mostra acerto por faixa de probabilidade para calibrar thresholds de aposta.
+    """
+    current_year = datetime.now(timezone.utc).year
+    if season is None:
+        season = (current_year - 1) if league in CROSS_YEAR_LEAGUES else current_year
+
+    # Busca predições com resultado real
+    resp = (
+        sb.table("predictions")
+        .select("match_id, over_15_prob, over_25_prob, btts_prob, expected_goals_home, expected_goals_away, matches!inner(home_goals, away_goals, status, season, league)")
+        .eq("matches.status", "FINISHED")
+        .eq("matches.season", season)
+        .eq("league", league)
+        .execute()
+    )
+
+    if not resp.data:
+        return {"league": league, "season": season, "total_matches": 0, "markets": {}}
+
+    # Faixas de probabilidade para análise
+    bands = [
+        (0.50, 0.60, "50-60%"),
+        (0.60, 0.70, "60-70%"),
+        (0.70, 0.80, "70-80%"),
+        (0.80, 0.90, "80-90%"),
+        (0.90, 1.01, "90-100%"),
+    ]
+
+    # Inicializa contadores
+    markets_data: dict = {}
+    for market_key in ["over_15", "over_25", "btts"]:
+        markets_data[market_key] = {
+            "total": 0, "correct": 0,
+            "bands": {label: {"total": 0, "correct": 0, "hit_rate": 0} for _, _, label in bands},
+        }
+
+    total_matches = 0
+    for row in resp.data:
+        m = row.get("matches", {})
+        hg = m.get("home_goals")
+        ag = m.get("away_goals")
+        if hg is None or ag is None:
+            continue
+
+        total_matches += 1
+        total_goals = hg + ag
+        both_scored = hg >= 1 and ag >= 1
+
+        # Over 1.5
+        o15_prob = row.get("over_15_prob")
+        if o15_prob is not None and o15_prob >= 0.50:
+            actual_o15 = total_goals > 1.5
+            md = markets_data["over_15"]
+            md["total"] += 1
+            if actual_o15:
+                md["correct"] += 1
+            for lo, hi, label in bands:
+                if lo <= o15_prob < hi:
+                    md["bands"][label]["total"] += 1
+                    if actual_o15:
+                        md["bands"][label]["correct"] += 1
+                    break
+
+        # Over 2.5
+        o25_prob = row.get("over_25_prob")
+        if o25_prob is not None and o25_prob >= 0.50:
+            actual_o25 = total_goals > 2.5
+            md = markets_data["over_25"]
+            md["total"] += 1
+            if actual_o25:
+                md["correct"] += 1
+            for lo, hi, label in bands:
+                if lo <= o25_prob < hi:
+                    md["bands"][label]["total"] += 1
+                    if actual_o25:
+                        md["bands"][label]["correct"] += 1
+                    break
+
+        # BTTS
+        btts_p = row.get("btts_prob")
+        if btts_p is not None and btts_p >= 0.50:
+            md = markets_data["btts"]
+            md["total"] += 1
+            if both_scored:
+                md["correct"] += 1
+            for lo, hi, label in bands:
+                if lo <= btts_p < hi:
+                    md["bands"][label]["total"] += 1
+                    if both_scored:
+                        md["bands"][label]["correct"] += 1
+                    break
+
+    # Calcula hit rates
+    for market_key, md in markets_data.items():
+        md["hit_rate"] = round(md["correct"] / md["total"] * 100, 1) if md["total"] > 0 else 0
+        for label, band in md["bands"].items():
+            band["hit_rate"] = round(band["correct"] / band["total"] * 100, 1) if band["total"] > 0 else 0
+
+    return {
+        "league": league,
+        "season": season,
+        "total_matches": total_matches,
+        "markets": markets_data,
     }
 
 
@@ -763,15 +1143,40 @@ def update_results(sb: Client = Depends(get_supabase)):
     # Atualiza apostas pendentes cujos jogos terminaram
     bets_updated = 0
     for match_id, actual_result in finished_match_ids:
+        # Busca placar real para resolver apostas de gols
+        match_score = (
+            sb.table("matches")
+            .select("home_goals, away_goals")
+            .eq("id", match_id)
+            .maybe_single()
+            .execute()
+        )
+        hg = (match_score.data or {}).get("home_goals")
+        ag = (match_score.data or {}).get("away_goals")
+        total_goals = (hg or 0) + (ag or 0)
+
         bets_resp = (
             sb.table("user_bets")
-            .select("id, bet_outcome")
+            .select("id, bet_outcome, market")
             .eq("match_id", match_id)
             .eq("status", "pending")
             .execute()
         )
         for bet in bets_resp.data:
-            new_status = "won" if bet["bet_outcome"] == actual_result else "lost"
+            outcome = bet["bet_outcome"]
+            market = bet.get("market", "result")
+
+            if market == "result":
+                new_status = "won" if outcome == actual_result else "lost"
+            elif market == "over_15":
+                new_status = "won" if total_goals > 1.5 else "lost"
+            elif market == "over_25":
+                new_status = "won" if total_goals > 2.5 else "lost"
+            elif market == "btts":
+                new_status = "won" if (hg and hg >= 1 and ag and ag >= 1) else "lost"
+            else:
+                new_status = "won" if outcome == actual_result else "lost"
+
             sb.table("user_bets").update({"status": new_status}).eq("id", bet["id"]).execute()
             bets_updated += 1
 
@@ -1198,7 +1603,7 @@ async def get_odds(league: str = "BSA", sb: Client = Depends(get_supabase)):
     params = {
         "apiKey": api_key,
         "regions": "eu",
-        "markets": "h2h,totals",
+        "markets": "h2h,totals,btts",
         "oddsFormat": "decimal",
     }
 
@@ -1237,6 +1642,8 @@ async def get_odds(league: str = "BSA", sb: Client = Depends(get_supabase)):
         # ── Agrega odds de TODAS as casas disponíveis ──────────────────────────
         all_h2h_odds: list[dict] = []
         all_totals_odds: list[dict] = []
+        all_over15_odds: list[dict] = []
+        all_btts_odds: list[dict] = []
 
         for bk in game.get("bookmakers", []):
             for market in bk.get("markets", []):
@@ -1254,18 +1661,42 @@ async def get_odds(league: str = "BSA", sb: Client = Depends(get_supabase)):
                             "odd_away": o_away,
                         })
                 elif market["key"] == "totals":
-                    over25 = under25 = None
+                    over25 = under25 = over15 = under15 = None
                     for o in market["outcomes"]:
                         if o.get("point") == 2.5:
                             if o["name"] == "Over":
                                 over25 = o["price"]
                             elif o["name"] == "Under":
                                 under25 = o["price"]
+                        elif o.get("point") == 1.5:
+                            if o["name"] == "Over":
+                                over15 = o["price"]
+                            elif o["name"] == "Under":
+                                under15 = o["price"]
                     if over25 or under25:
                         all_totals_odds.append({
                             "bookmaker": bk["key"],
                             "odd_over25": over25,
                             "odd_under25": under25,
+                        })
+                    if over15 or under15:
+                        all_over15_odds.append({
+                            "bookmaker": bk["key"],
+                            "odd_over15": over15,
+                            "odd_under15": under15,
+                        })
+                elif market["key"] == "btts":
+                    odd_yes = odd_no = None
+                    for o in market["outcomes"]:
+                        if o["name"] == "Yes":
+                            odd_yes = o["price"]
+                        elif o["name"] == "No":
+                            odd_no = o["price"]
+                    if odd_yes or odd_no:
+                        all_btts_odds.append({
+                            "bookmaker": bk["key"],
+                            "odd_btts_yes": odd_yes,
+                            "odd_btts_no": odd_no,
                         })
 
         # ── Melhor odd disponível (máximo entre casas) ─────────────────────────
@@ -1274,6 +1705,10 @@ async def get_odds(league: str = "BSA", sb: Client = Depends(get_supabase)):
         best_odd_away  = max((b["odd_away"] for b in all_h2h_odds if b["odd_away"]), default=None)
         best_over25    = max((b["odd_over25"] for b in all_totals_odds if b["odd_over25"]), default=None)
         best_under25   = max((b["odd_under25"] for b in all_totals_odds if b["odd_under25"]), default=None)
+        best_over15    = max((b["odd_over15"] for b in all_over15_odds if b["odd_over15"]), default=None)
+        best_under15   = max((b["odd_under15"] for b in all_over15_odds if b["odd_under15"]), default=None)
+        best_btts_yes  = max((b["odd_btts_yes"] for b in all_btts_odds if b["odd_btts_yes"]), default=None)
+        best_btts_no   = max((b["odd_btts_no"] for b in all_btts_odds if b["odd_btts_no"]), default=None)
 
         # Casa com melhor odd para H2H (preferência: Pinnacle)
         bk_h2h = _best_bookmaker([b for b in game.get("bookmakers", [])
@@ -1319,9 +1754,21 @@ async def get_odds(league: str = "BSA", sb: Client = Depends(get_supabase)):
             "odd_under25_market": best_under25,
             "best_over25_bk":     _best_bk_for("odd_over25", all_totals_odds),
             "best_under25_bk":    _best_bk_for("odd_under25", all_totals_odds),
+            # Over/Under 1.5 de mercado
+            "odd_over15_market":  best_over15,
+            "odd_under15_market": best_under15,
+            "best_over15_bk":     _best_bk_for("odd_over15", all_over15_odds),
+            "best_under15_bk":    _best_bk_for("odd_under15", all_over15_odds),
+            # BTTS de mercado
+            "odd_btts_yes":       best_btts_yes,
+            "odd_btts_no":        best_btts_no,
+            "best_btts_yes_bk":   _best_bk_for("odd_btts_yes", all_btts_odds),
+            "best_btts_no_bk":    _best_bk_for("odd_btts_no", all_btts_odds),
             # Todas as casas (para comparação)
             "all_h2h_odds":       all_h2h_odds,
             "all_totals_odds":    all_totals_odds,
+            "all_over15_odds":    all_over15_odds,
+            "all_btts_odds":      all_btts_odds,
             # Modelo Poisson
             "model_over15":       model_over15,
             "model_over25":       model_over25,
@@ -1871,15 +2318,40 @@ def sync_results(league: str = "BSA", sb: Client = Depends(get_supabase)):
     # ── 3. Atualiza apostas ────────────────────────────────────────────────────
     bets_updated = 0
     for match_id, actual_result in finished_match_ids:
+        # Busca placar real para resolver apostas de gols
+        match_score = (
+            sb.table("matches")
+            .select("home_goals, away_goals")
+            .eq("id", match_id)
+            .maybe_single()
+            .execute()
+        )
+        hg = (match_score.data or {}).get("home_goals")
+        ag = (match_score.data or {}).get("away_goals")
+        total_goals = (hg or 0) + (ag or 0)
+
         bets_resp = (
             sb.table("user_bets")
-            .select("id, bet_outcome")
+            .select("id, bet_outcome, market")
             .eq("match_id", match_id)
             .eq("status", "pending")
             .execute()
         )
         for bet in bets_resp.data:
-            new_status = "won" if bet["bet_outcome"] == actual_result else "lost"
+            outcome = bet["bet_outcome"]
+            market = bet.get("market", "result")
+
+            if market == "result":
+                new_status = "won" if outcome == actual_result else "lost"
+            elif market == "over_15":
+                new_status = "won" if total_goals > 1.5 else "lost"
+            elif market == "over_25":
+                new_status = "won" if total_goals > 2.5 else "lost"
+            elif market == "btts":
+                new_status = "won" if (hg and hg >= 1 and ag and ag >= 1) else "lost"
+            else:
+                new_status = "won" if outcome == actual_result else "lost"
+
             sb.table("user_bets").update({"status": new_status}).eq("id", bet["id"]).execute()
             bets_updated += 1
 
@@ -2135,12 +2607,12 @@ def _build_picks(sb: Client, league: str = "BSA") -> list[dict]:
         if odds_key:
             r = req.get(
                 f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds",
-                params={"apiKey": odds_key, "regions": "eu", "markets": "h2h,totals", "oddsFormat": "decimal"},
+                params={"apiKey": odds_key, "regions": "eu", "markets": "h2h,totals,btts", "oddsFormat": "decimal"},
                 timeout=10
             )
             if r.ok:
                 for game in r.json():
-                    best_h = best_d = best_a = best_o25 = None
+                    best_h = best_d = best_a = best_o25 = best_o15 = best_btts = None
                     for bk in game.get("bookmakers", []):
                         for mkt in bk.get("markets", []):
                             if mkt["key"] == "h2h":
@@ -2150,12 +2622,20 @@ def _build_picks(sb: Client, league: str = "BSA") -> list[dict]:
                                     else: best_d = max(best_d or 0, o["price"])
                             elif mkt["key"] == "totals":
                                 for o in mkt["outcomes"]:
-                                    if o["name"] == "Over": best_o25 = max(best_o25 or 0, o["price"])
+                                    if o["name"] == "Over" and o.get("point") == 2.5:
+                                        best_o25 = max(best_o25 or 0, o["price"])
+                                    if o["name"] == "Over" and o.get("point") == 1.5:
+                                        best_o15 = max(best_o15 or 0, o["price"])
+                            elif mkt["key"] == "btts":
+                                for o in mkt["outcomes"]:
+                                    if o["name"] == "Yes":
+                                        best_btts = max(best_btts or 0, o["price"])
                     ht = game.get("home_team", "")
                     at = game.get("away_team", "")
                     odds_map[(_norm(ht), _norm(at))] = {
                         "odd_home": best_h, "odd_draw": best_d,
                         "odd_away": best_a, "odd_over25_market": best_o25,
+                        "odd_over15_market": best_o15, "odd_btts_market": best_btts,
                     }
     except Exception as e:
         log.warning(f"_build_picks odds fetch: {e}")
@@ -2191,10 +2671,12 @@ def _build_picks(sb: Client, league: str = "BSA") -> list[dict]:
             "score": conf * 0.7 + prob_result * 0.3 + (0.2 if ev_result and ev_result > 0 else 0),
         })
 
-        # 2. Over 1.5 (sem odd de mercado — mostra odd justa)
+        # 2. Over 1.5 (com odd de mercado quando disponível)
         o15 = f.get("over_15_prob") or 0
         if o15 >= 0.65:
             fair_o15 = round(1 / o15, 2) if o15 > 0 else None
+            odd_o15 = mkt.get("odd_over15_market") if mkt else None
+            ev_o15 = round((o15 * odd_o15 - 1) * 100, 1) if odd_o15 else None
             candidates.append({
                 "match": f"{f['home_team']} vs {f['away_team']}",
                 "matchday": f.get("matchday"),
@@ -2203,16 +2685,16 @@ def _build_picks(sb: Client, league: str = "BSA") -> list[dict]:
                 "prob": round(o15 * 100),
                 "tier": tier,
                 "fair_odd": fair_o15,
-                "market_odd": None,  # sem odd de mercado disponível
-                "ev": None,
-                "score": o15 * 0.8 + conf * 0.2,
+                "market_odd": odd_o15,
+                "ev": ev_o15,
+                "score": o15 * 0.8 + (0.2 if ev_o15 and ev_o15 > 0 else 0) + conf * 0.1,
             })
 
-        # 3. Over 2.5 com odd de mercado
+        # 3. Over 2.5 (com odd de mercado)
         o25 = f.get("over_25_prob") or 0
         odd_o25 = mkt.get("odd_over25_market") if mkt else None
-        if o25 >= 0.45 and odd_o25:
-            ev_o25 = round((o25 * odd_o25 - 1) * 100, 1)
+        if o25 >= 0.45:
+            ev_o25 = round((o25 * odd_o25 - 1) * 100, 1) if odd_o25 else None
             fair_o25 = round(1 / o25, 2) if o25 > 0 else None
             candidates.append({
                 "match": f"{f['home_team']} vs {f['away_team']}",
@@ -2224,24 +2706,26 @@ def _build_picks(sb: Client, league: str = "BSA") -> list[dict]:
                 "fair_odd": fair_o25,
                 "market_odd": odd_o25,
                 "ev": ev_o25,
-                "score": o25 * 0.5 + (0.3 if ev_o25 > 0 else 0) + conf * 0.2,
+                "score": o25 * 0.5 + (0.3 if ev_o25 and ev_o25 > 0 else 0) + conf * 0.2,
             })
 
-        # 4. BTTS
-        btts = f.get("btts_prob") or 0
-        if btts >= 0.55:
-            fair_btts = round(1 / btts, 2) if btts > 0 else None
+        # 4. BTTS (com odd de mercado quando disponível)
+        btts_val = f.get("btts_prob") or 0
+        if btts_val >= 0.55:
+            fair_btts_val = round(1 / btts_val, 2) if btts_val > 0 else None
+            odd_btts_mkt = mkt.get("odd_btts_market") if mkt else None
+            ev_btts = round((btts_val * odd_btts_mkt - 1) * 100, 1) if odd_btts_mkt else None
             candidates.append({
                 "match": f"{f['home_team']} vs {f['away_team']}",
                 "matchday": f.get("matchday"),
                 "match_date": (f.get("match_date") or "")[:10],
                 "market": "Ambos marcam",
-                "prob": round(btts * 100),
+                "prob": round(btts_val * 100),
                 "tier": tier,
-                "fair_odd": fair_btts,
-                "market_odd": None,
-                "ev": None,
-                "score": btts * 0.7 + conf * 0.3,
+                "fair_odd": fair_btts_val,
+                "market_odd": odd_btts_mkt,
+                "ev": ev_btts,
+                "score": btts_val * 0.7 + (0.2 if ev_btts and ev_btts > 0 else 0) + conf * 0.1,
             })
 
     # Ordena por probabilidade decrescente (mais provável primeiro)
